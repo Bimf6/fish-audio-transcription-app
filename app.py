@@ -97,8 +97,8 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file):
     if uploaded_file is not None and api_key:
         try:
             with st.spinner("Transcribing audio..."):
-        audio_data = uploaded_file.read()
-        lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
+                audio_data = uploaded_file.read()
+                lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
                 
                 # Direct API call to Fish Audio (using same format as SDK)
                 url = "https://api.fish.audio/v1/asr"
