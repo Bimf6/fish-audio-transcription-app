@@ -1,183 +1,75 @@
-# Fish Audio Python SDK
+# Fish Audio Transcription App
 
-To provide convenient Python program integration for https://docs.fish.audio.
+A Streamlit web application for transcribing audio files using the Fish Audio API.
 
-## Install
+## Features
 
-```bash
-pip install fish-audio-sdk
-```
+- 🎤 Upload audio files (MP3, WAV, M4A, FLAC)
+- 🌍 Support for multiple languages (Mandarin, English, Cantonese)
+- 🔍 Auto-language detection
+- 📝 Download transcriptions as text files
+- 🔐 Secure API key management
+
+## Prerequisites
+
+- Python 3.10 or higher
+- Fish Audio API key
+
+## Installation
+
+1. **Install Python 3.10+** (if not already installed):
+   ```bash
+   # On macOS with Homebrew
+   brew install python@3.10
+   ```
+
+2. **Install dependencies**:
+   ```bash
+   python3.10 -m pip install -r requirements.txt
+   ```
+
+3. **Install the Fish Audio SDK**:
+   ```bash
+   python3.10 -m pip install .
+   ```
 
 ## Usage
 
-Initialize a `Session` to use APIs. All APIs have synchronous and asynchronous versions. If you want to use the asynchronous version of the API, you only need to rewrite the original `session.api_call(...)` to `session.api_call.awaitable(...)`.
-
-```python
-from fish_audio_sdk import Session
-
-session = Session("your_api_key")
+### Option 1: Using the shell script
+```bash
+./run_app.sh
 ```
 
-Sometimes, you may need to change our endpoint to another address. You can use
-
-```python
-from fish_audio_sdk import Session
-
-session = Session("your_api_key", base_url="https://your-proxy-domain")
+### Option 2: Direct command
+```bash
+python3.10 -m streamlit run app.py
 ```
 
-### Text to speech
-
-```python
-from fish_audio_sdk import Session, TTSRequest
-
-session = Session("your_api_key")
-
-with open("r.mp3", "wb") as f:
-    for chunk in session.tts(TTSRequest(text="Hello, world!")):
-        f.write(chunk)
+### Option 3: Set environment variable and run
+```bash
+export FISH_AUDIO_API_KEY="your_api_key_here"
+python3.10 -m streamlit run app.py
 ```
 
-Or use async version:
+## Configuration
 
-```python
-import asyncio
-import aiofiles
+- **API Key**: Enter your Fish Audio API key in the sidebar, or set the `FISH_AUDIO_API_KEY` environment variable
+- **Language**: Select the language of your audio file or use "Auto Detect"
+- **File Formats**: Supports MP3, WAV, M4A, and FLAC files
 
-from fish_audio_sdk import Session, TTSRequest
+## Troubleshooting
 
-session = Session("your_api_key")
+- **Python Version Error**: Make sure you're using Python 3.10 or higher
+- **Import Errors**: Ensure the Fish Audio SDK is properly installed
+- **API Errors**: Verify your API key is correct and has sufficient credits
 
+## Development
 
-async def main():
-    async with aiofiles.open("r.mp3", "wb") as f:
-        async for chunk in session.tts.awaitable(
-            TTSRequest(text="Hello, world!"),
-        ):
-            await f.write(chunk)
-
-
-asyncio.run(main())
+To run in development mode:
+```bash
+python3.10 -m streamlit run app.py --server.port 8501
 ```
 
-#### Reference Audio
+## License
 
-```python
-from fish_audio_sdk import TTSRequest
-
-TTSRequest(
-    text="Hello, world!",
-    reference_id="your_model_id",
-)
-```
-
-Or just use `ReferenceAudio` in `TTSRequest`:
-
-```python
-from fish_audio_sdk import TTSRequest, ReferenceAudio
-
-TTSRequest(
-    text="Hello, world!",
-    references=[
-        ReferenceAudio(
-            audio=audio_file.read(),
-            text="reference audio text",
-        )
-    ],
-)
-```
-
-### List models
-
-```python
-models = session.list_models()
-print(models)
-```
-
-Or use async version:
-
-```python
-import asyncio
-
-
-async def main():
-    models = await session.list_models.awaitable()
-    print(models)
-
-
-asyncio.run(main())
-```
-
-
-
-### Get a model info by id
-
-```python
-model = session.get_model("your_model_id")
-print(model)
-```
-
-Or use async version:
-
-```python
-import asyncio
-
-
-async def main():
-    model = await session.get_model.awaitable("your_model_id")
-    print(model)
-
-
-asyncio.run(main())
-```
-
-### Create a model
-
-```python
-model = session.create_model(
-    title="test",
-    description="test",
-    voices=[voice_file.read(), other_voice_file.read()],
-    cover_image=image_file.read(),
-)
-print(model)
-```
-
-Or use async version:
-
-```python
-import asyncio
-
-
-async def main():
-    model = await session.create_model.awaitable(
-        title="test",
-        description="test",
-        voices=[voice_file.read(), other_voice_file.read()],
-        cover_image=image_file.read(),
-    )
-    print(model)
-
-
-asyncio.run(main())
-```
-
-
-### Delete a model
-
-```python
-session.delete_model("your_model_id")
-```
-
-Or use async version:
-
-```python
-import asyncio
-
-
-async def main():
-    await session.delete_model.awaitable("your_model_id")
-
-
-asyncio.run(main())
-```
+MIT License
