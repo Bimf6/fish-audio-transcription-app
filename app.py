@@ -1,7 +1,9 @@
 import streamlit as st
 import os
+import sys
 import requests
 import base64
+import ormsgpack
 
 LANGUAGE_MAP = {
     "Mandarin": "zh",
@@ -16,6 +18,17 @@ st.set_page_config(
 )
 
 st.title("🎤 Fish Audio Transcription")
+
+# Debug info (only show in development)
+if os.getenv("DEBUG") == "true":
+    st.sidebar.write("🔧 Debug Info")
+    st.sidebar.write(f"Python: {sys.version}")
+    st.sidebar.write(f"Streamlit: {st.__version__}")
+    try:
+        import ormsgpack
+        st.sidebar.write("✅ ormsgpack imported")
+    except ImportError:
+        st.sidebar.write("❌ ormsgpack failed")
 
 # API Key configuration
 # Try to get API key from Streamlit secrets first, then environment variables, then default
@@ -58,18 +71,27 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file):
                 audio_data = uploaded_file.read()
                 lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
                 
-                # Direct API call to Fish Audio
+                # Direct API call to Fish Audio (using same format as SDK)
                 url = "https://api.fish.audio/v1/asr"
                 headers = {
                     "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/octet-stream"
+                    "Content-Type": "application/msgpack"
                 }
                 
-                # Add language parameter if specified
+                # Create the request payload (same as ASRRequest)
+                payload = {
+                    "audio": audio_data,
+                }
                 if lang_code:
-                    headers["language"] = lang_code
+                    payload["language"] = lang_code
                 
-                response = requests.post(url, headers=headers, data=audio_data, timeout=30)
+                # Use ormsgpack like the original SDK
+                response = requests.post(
+                    url, 
+                    headers=headers, 
+                    data=ormsgpack.packb(payload), 
+                    timeout=30
+                )
                 
                 if response.status_code == 200:
                     result = response.json()
