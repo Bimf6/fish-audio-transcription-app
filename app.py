@@ -1,16 +1,7 @@
 import streamlit as st
 import os
-import sys
-
-# Add the current directory to Python path for local SDK import
-sys.path.insert(0, '.')
-
-try:
-    from fish_audio_sdk import Session, ASRRequest
-except ImportError as e:
-    st.error(f"Import error: {e}")
-    st.error("Please check if all dependencies are installed correctly.")
-    st.stop()
+import requests
+import base64
 
 LANGUAGE_MAP = {
     "Mandarin": "zh",
@@ -65,11 +56,35 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file):
         try:
             with st.spinner("Transcribing audio..."):
                 audio_data = uploaded_file.read()
-                session = Session(api_key)
                 lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
-                response = session.asr(ASRRequest(audio=audio_data, language=lang_code))
-                st.session_state['transcript'] = response.text
-                st.success("Transcription completed!")
+                
+                # Direct API call to Fish Audio
+                url = "https://api.fish.audio/v1/asr"
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/octet-stream"
+                }
+                
+                # Add language parameter if specified
+                if lang_code:
+                    headers["language"] = lang_code
+                
+                response = requests.post(url, headers=headers, data=audio_data, timeout=30)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    st.session_state['transcript'] = result.get('text', 'No transcript available')
+                    st.success("Transcription completed!")
+                else:
+                    st.error(f"API Error {response.status_code}: {response.text}")
+                    st.session_state['transcript'] = ""
+                    
+        except requests.exceptions.Timeout:
+            st.error("Request timed out. Please try with a smaller audio file.")
+            st.session_state['transcript'] = ""
+        except requests.exceptions.RequestException as e:
+            st.error(f"Network error: {str(e)}")
+            st.session_state['transcript'] = ""
         except Exception as e:
             st.error(f"Error during transcription: {str(e)}")
             st.session_state['transcript'] = ""
