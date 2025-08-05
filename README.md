@@ -1,14 +1,27 @@
-# Fish Audio Transcription App
+# 🎤 Fish Audio Transcription App
 
-A Streamlit web application for transcribing audio files using the Fish Audio API.
+A powerful Streamlit web application for advanced audio transcription with speaker identification and timecode analysis using the Fish Audio API.
 
-## Features
+## ✨ Features
 
+### Core Transcription
 - 🎤 Upload audio files (MP3, WAV, M4A, FLAC)
-- 🌍 Support for multiple languages (Mandarin, English, Cantonese)
-- 🔍 Auto-language detection
-- 📝 Download transcriptions as text files
+- 🌍 Multi-language support (Auto-detect, Mandarin, English, Cantonese)
+- ⚡ Fast, accurate transcription using Fish Audio API
 - 🔐 Secure API key management
+
+### Advanced Features
+- 👥 **Speaker Identification**: Automatically identify different speakers
+- ⏰ **Detailed Timecodes**: Precise timestamps for each segment
+- 🔍 **Search Functionality**: Search through transcript content
+- 📊 **Audio Analytics**: Duration, segment count, speaker statistics
+- 🎛️ **Customizable Speaker Labels**: Name your speakers
+
+### Export Options
+- 📄 **Formatted Transcript**: Text with speakers and timecodes
+- 🎬 **SRT Subtitles**: Professional subtitle format
+- 🔧 **JSON Data**: Raw API response for developers
+- 📋 **Multiple Formats**: Choose your preferred output
 
 ## Prerequisites
 
