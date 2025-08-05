@@ -104,8 +104,8 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file):
     if uploaded_file is not None and api_key:
         try:
             with st.spinner("Transcribing audio..."):
-                audio_data = uploaded_file.read()
-                lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
+        audio_data = uploaded_file.read()
+        lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
                 
                 # Direct API call to Fish Audio (using same format as SDK)
                 url = "https://api.fish.audio/v1/asr"
@@ -117,6 +117,7 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file):
                 # Create the request payload (same as ASRRequest)
                 payload = {
                     "audio": audio_data,
+                    "ignore_timestamps": False,  # Enable timestamps
                 }
                 if lang_code:
                     payload["language"] = lang_code
@@ -131,10 +132,23 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file):
                 
                 if response.status_code == 200:
                     result = response.json()
+                    
+                    # Debug: Show API response structure
+                    if os.getenv("DEBUG") == "true":
+                        st.write("**API Response Debug:**")
+                        st.write(f"Response keys: {list(result.keys())}")
+                        st.write(f"Full response: {result}")
+                    
                     st.session_state['transcript'] = result.get('text', 'No transcript available')
                     st.session_state['transcript_data'] = result
                     st.session_state['segments'] = result.get('segments', [])
                     st.session_state['duration'] = result.get('duration', 0)
+                    
+                    # Debug: Show what we stored
+                    if os.getenv("DEBUG") == "true":
+                        st.write(f"**Stored segments count**: {len(st.session_state['segments'])}")
+                        st.write(f"**Stored transcript length**: {len(st.session_state['transcript'])}")
+                    
                     st.success("Transcription completed!")
                 else:
                     st.error(f"API Error {response.status_code}: {response.text}")
@@ -221,7 +235,7 @@ if st.session_state['transcript']:
         st.subheader("📝 Detailed Transcript")
         
         # Show segments with timecodes and speakers
-        if st.session_state['segments']:
+        if st.session_state['segments'] and len(st.session_state['segments']) > 0:
             # Get settings from main toggles and advanced options
             include_timestamps = st.session_state.get('main_timestamps', True)
             show_speakers = st.session_state.get('main_speakers', True)
@@ -352,14 +366,18 @@ if st.session_state['transcript']:
                     
                     # Add some spacing between segments
                     st.write("")
-        else:
-            # Fallback if no segments available
+        elif st.session_state['transcript']:
+            # Fallback if no segments available but we have transcript text
+            st.info("⚠️ Segments with timestamps not available. Showing full transcript only.")
             st.text_area(
                 "Full Transcript", 
                 st.session_state['transcript'], 
                 height=400,
                 disabled=True
             )
+        else:
+            # No transcript data at all
+            st.info("No transcript data available. Please upload and transcribe an audio file.")
     
     with col2:
         st.subheader("🔍 Search & Filter")
