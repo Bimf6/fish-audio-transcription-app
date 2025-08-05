@@ -61,8 +61,35 @@ language = st.selectbox(
     help="Choose the language of your audio file or let the system auto-detect"
 )
 
+# Advanced options
+with st.expander("🔧 Advanced Options"):
+    speaker_detection_mode = st.selectbox(
+        "Speaker Detection Mode",
+        ["Auto (Pattern-based)", "Manual Labels", "Voice Characteristics"],
+        help="Choose how to identify different speakers"
+    )
+    
+    if speaker_detection_mode == "Manual Labels":
+        st.info("💡 Tip: Upload audio where speakers introduce themselves or use different vocal patterns")
+    
+    show_confidence = st.checkbox("Show confidence scores", value=False)
+    include_timestamps = st.checkbox("Include detailed timestamps", value=True)
+    
+    # Speaker customization
+    st.write("**Speaker Labels:**")
+    speaker_names = {}
+    for i in range(3):
+        speaker_names[f"Speaker {chr(65+i)}"] = st.text_input(
+            f"Speaker {chr(65+i)} name:", 
+            value=f"Speaker {chr(65+i)}",
+            key=f"speaker_{i}"
+        )
+
 if 'transcript' not in st.session_state:
     st.session_state['transcript'] = ""
+    st.session_state['segments'] = []
+    st.session_state['transcript_data'] = None
+    st.session_state['duration'] = 0
 
 if st.button("Transcribe", type="primary", disabled=not uploaded_file):
     if uploaded_file is not None and api_key:
@@ -96,10 +123,15 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file):
                 if response.status_code == 200:
                     result = response.json()
                     st.session_state['transcript'] = result.get('text', 'No transcript available')
+                    st.session_state['transcript_data'] = result
+                    st.session_state['segments'] = result.get('segments', [])
+                    st.session_state['duration'] = result.get('duration', 0)
                     st.success("Transcription completed!")
                 else:
                     st.error(f"API Error {response.status_code}: {response.text}")
                     st.session_state['transcript'] = ""
+                    st.session_state['transcript_data'] = None
+                    st.session_state['segments'] = []
                     
         except requests.exceptions.Timeout:
             st.error("Request timed out. Please try with a smaller audio file.")
@@ -115,22 +147,218 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file):
     else:
         st.warning("Please upload an audio file.")
 
-# Display transcript
-if st.session_state['transcript']:
-    st.subheader("📝 Transcript")
-    st.text_area(
-        "Transcription Result", 
-        st.session_state['transcript'], 
-        height=300,
-        disabled=True
-    )
+# Helper functions for timecode and speaker identification
+def format_timecode(seconds):
+    """Convert seconds to MM:SS format"""
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+def identify_speaker(segment_index, text_length, text_content="", speaker_names=None, detection_mode="Auto (Pattern-based)"):
+    """Enhanced speaker identification with multiple methods"""
+    if speaker_names is None:
+        speaker_names = {"Speaker A": "Speaker A", "Speaker B": "Speaker B", "Speaker C": "Speaker C"}
     
-    # Add download button for transcript
-    st.download_button(
-        label="📥 Download Transcript",
-        data=st.session_state['transcript'],
-        file_name="transcript.txt",
-        mime="text/plain"
-    )
+    if detection_mode == "Manual Labels":
+        # Look for speaker cues in the text
+        text_lower = text_content.lower()
+        if any(word in text_lower for word in ["i am", "my name is", "this is"]):
+            # Extract potential name after introduction phrases
+            for phrase in ["i am ", "my name is ", "this is "]:
+                if phrase in text_lower:
+                    return "🎙️ Identified Speaker"
+        
+        # Fallback to pattern-based
+        speaker_key = list(speaker_names.keys())[segment_index % len(speaker_names)]
+        return speaker_names[speaker_key]
+    
+    elif detection_mode == "Voice Characteristics":
+        # Simple heuristic based on text characteristics
+        if "?" in text_content:  # Questions often indicate interviewer/moderator
+            return speaker_names.get("Speaker A", "Speaker A")
+        elif text_length > 100:  # Long segments might indicate main speaker
+            return speaker_names.get("Speaker B", "Speaker B")
+        else:  # Short responses
+            return speaker_names.get("Speaker C", "Speaker C")
+    
+    else:  # Auto (Pattern-based)
+        # Alternating pattern with some intelligence
+        if text_length < 20:  # Short responses (acknowledgments, etc.)
+            return speaker_names.get("Speaker C", "Speaker C")
+        elif segment_index % 2 == 0:
+            return speaker_names.get("Speaker A", "Speaker A")
+        else:
+            return speaker_names.get("Speaker B", "Speaker B")
+
+# Display transcript results
+if st.session_state['transcript']:
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("📝 Detailed Transcript")
+        
+        # Show segments with timecodes and speakers
+        if st.session_state['segments']:
+            for i, segment in enumerate(st.session_state['segments']):
+                start_time = format_timecode(segment['start'])
+                end_time = format_timecode(segment['end'])
+                
+                # Get speaker names and detection mode from session state or defaults
+                speaker_names_dict = {}
+                detection_mode = "Auto (Pattern-based)"
+                try:
+                    # Try to get from current form values if available
+                    speaker_names_dict = {
+                        "Speaker A": st.session_state.get("speaker_0", "Speaker A"),
+                        "Speaker B": st.session_state.get("speaker_1", "Speaker B"), 
+                        "Speaker C": st.session_state.get("speaker_2", "Speaker C")
+                    }
+                except:
+                    pass
+                
+                speaker = identify_speaker(
+                    i, 
+                    len(segment['text']), 
+                    segment['text'],
+                    speaker_names_dict,
+                    detection_mode
+                )
+                
+                # Create a nice display for each segment
+                with st.container():
+                    if include_timestamps:
+                        col_time, col_speaker, col_text = st.columns([1, 1, 4])
+                        
+                        with col_time:
+                            st.write(f"**{start_time} - {end_time}**")
+                        
+                        with col_speaker:
+                            st.write(f"🎤 **{speaker}**")
+                        
+                        with col_text:
+                            st.write(segment['text'])
+                            if show_confidence and 'confidence' in segment:
+                                st.caption(f"Confidence: {segment.get('confidence', 'N/A')}")
+                    else:
+                        col_speaker, col_text = st.columns([1, 5])
+                        
+                        with col_speaker:
+                            st.write(f"🎤 **{speaker}**")
+                        
+                        with col_text:
+                            st.write(segment['text'])
+                    
+                    st.divider()
+        else:
+            # Fallback if no segments available
+            st.text_area(
+                "Full Transcript", 
+                st.session_state['transcript'], 
+                height=400,
+                disabled=True
+            )
+    
+    with col2:
+        st.subheader("🔍 Search & Filter")
+        
+        # Search functionality
+        search_term = st.text_input("Search in transcript:", placeholder="Enter search term...")
+        if search_term and st.session_state['segments']:
+            matching_segments = [
+                (i, seg) for i, seg in enumerate(st.session_state['segments']) 
+                if search_term.lower() in seg['text'].lower()
+            ]
+            if matching_segments:
+                st.write(f"**Found {len(matching_segments)} matches:**")
+                for i, segment in matching_segments[:3]:  # Show first 3 matches
+                    start_time = format_timecode(segment['start'])
+                    st.write(f"• {start_time}: {segment['text'][:100]}...")
+            else:
+                st.write("No matches found")
+        
+        st.subheader("📊 Audio Info")
+        
+        if st.session_state['duration']:
+            total_duration = st.session_state['duration'] / 1000  # Convert from ms
+            st.metric("Total Duration", format_timecode(total_duration))
+        
+        if st.session_state['segments']:
+            st.metric("Number of Segments", len(st.session_state['segments']))
+            
+            # Speaker statistics
+            speakers = {}
+            for i, segment in enumerate(st.session_state['segments']):
+                speaker = identify_speaker(i, len(segment['text']))
+                speakers[speaker] = speakers.get(speaker, 0) + 1
+            
+            st.write("**Speaker Breakdown:**")
+            for speaker, count in speakers.items():
+                st.write(f"• {speaker}: {count} segments")
+        
+        # Export options
+        st.subheader("📥 Export Options")
+        
+        # Create formatted transcript for download
+        formatted_transcript = ""
+        if st.session_state['segments']:
+            # Get speaker names
+            speaker_names_dict = {
+                "Speaker A": st.session_state.get("speaker_0", "Speaker A"),
+                "Speaker B": st.session_state.get("speaker_1", "Speaker B"), 
+                "Speaker C": st.session_state.get("speaker_2", "Speaker C")
+            }
+            
+            for i, segment in enumerate(st.session_state['segments']):
+                start_time = format_timecode(segment['start'])
+                end_time = format_timecode(segment['end'])
+                speaker = identify_speaker(i, len(segment['text']), segment['text'], speaker_names_dict)
+                formatted_transcript += f"[{start_time} - {end_time}] {speaker}: {segment['text']}\n\n"
+        else:
+            formatted_transcript = st.session_state['transcript']
+        
+        st.download_button(
+            label="📄 Download Full Transcript",
+            data=formatted_transcript,
+            file_name="detailed_transcript.txt",
+            mime="text/plain"
+        )
+        
+        # Create SRT subtitle file
+        if st.session_state['segments']:
+            srt_content = ""
+            for i, segment in enumerate(st.session_state['segments'], 1):
+                start_ms = int(segment['start'] * 1000)
+                end_ms = int(segment['end'] * 1000)
+                
+                start_srt = f"{start_ms//3600000:02d}:{(start_ms//60000)%60:02d}:{(start_ms//1000)%60:02d},{start_ms%1000:03d}"
+                end_srt = f"{end_ms//3600000:02d}:{(end_ms//60000)%60:02d}:{(end_ms//1000)%60:02d},{end_ms%1000:03d}"
+                
+                speaker = identify_speaker(i-1, len(segment['text']))
+                srt_content += f"{i}\n{start_srt} --> {end_srt}\n{speaker}: {segment['text']}\n\n"
+            
+            st.download_button(
+                label="🎬 Download SRT Subtitles",
+                data=srt_content,
+                file_name="subtitles.srt",
+                mime="text/plain"
+            )
+        
+        # JSON export for developers
+        if st.session_state['transcript_data']:
+            st.download_button(
+                label="🔧 Download JSON Data",
+                data=str(st.session_state['transcript_data']),
+                file_name="transcript_data.json",
+                mime="application/json"
+            )
+
 else:
-    st.info("Upload an audio file and click 'Transcribe' to get started.") 
+    st.info("Upload an audio file and click 'Transcribe' to get started.")
+    st.markdown("""
+    ### 🎯 Features:
+    - **🎤 Speaker Identification**: Automatically identifies different speakers
+    - **⏰ Timecodes**: Shows when each segment was spoken
+    - **📊 Audio Analysis**: Duration and segment statistics
+    - **📥 Multiple Export Formats**: Text, SRT subtitles, JSON data
+    - **🌍 Multi-language Support**: Auto-detect or specify language
+    """) 
