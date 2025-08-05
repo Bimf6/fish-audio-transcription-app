@@ -5,7 +5,12 @@ import sys
 # Add the current directory to Python path for local SDK import
 sys.path.insert(0, '.')
 
-from fish_audio_sdk import Session, ASRRequest
+try:
+    from fish_audio_sdk import Session, ASRRequest
+except ImportError as e:
+    st.error(f"Import error: {e}")
+    st.error("Please check if all dependencies are installed correctly.")
+    st.stop()
 
 LANGUAGE_MAP = {
     "Mandarin": "zh",
@@ -25,8 +30,12 @@ st.title("🎤 Fish Audio Transcription")
 # Try to get API key from Streamlit secrets first, then environment variables, then default
 default_api_key = ""
 try:
-    default_api_key = st.secrets.get("FISH_AUDIO_API_KEY", "")
-except:
+    if hasattr(st, 'secrets') and "FISH_AUDIO_API_KEY" in st.secrets:
+        default_api_key = st.secrets["FISH_AUDIO_API_KEY"]
+    else:
+        default_api_key = os.getenv("FISH_AUDIO_API_KEY", "")
+except Exception as e:
+    st.error(f"Error loading secrets: {e}")
     default_api_key = os.getenv("FISH_AUDIO_API_KEY", "")
 
 api_key = st.sidebar.text_input(
