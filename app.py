@@ -61,6 +61,13 @@ language = st.selectbox(
     help="Choose the language of your audio file or let the system auto-detect"
 )
 
+# Main display options (always visible)
+col1_opts, col2_opts = st.columns(2)
+with col1_opts:
+    show_timestamps_main = st.checkbox("📅 Show Timestamps", value=True, key="main_timestamps")
+with col2_opts:
+    show_speakers_main = st.checkbox("🎤 Show Speakers", value=True, key="main_speakers")
+
 # Advanced options
 with st.expander("🔧 Advanced Options"):
     speaker_detection_mode = st.selectbox(
@@ -215,10 +222,15 @@ if st.session_state['transcript']:
         
         # Show segments with timecodes and speakers
         if st.session_state['segments']:
-            # Get settings from session state or use defaults
-            include_timestamps = st.session_state.get('include_timestamps', True)
+            # Get settings from main toggles and advanced options
+            include_timestamps = st.session_state.get('main_timestamps', True)
+            show_speakers = st.session_state.get('main_speakers', True)
             show_confidence = st.session_state.get('show_confidence', False)
             use_card_view = st.session_state.get('use_card_view', True)
+            
+            # Debug: Show current settings
+            if os.getenv("DEBUG") == "true":
+                st.write(f"**Settings Debug**: timestamps={include_timestamps}, speakers={show_speakers}, confidence={show_confidence}, card_view={use_card_view}")
             
             # Debug information (only show if DEBUG is enabled)
             if os.getenv("DEBUG") == "true":
@@ -254,7 +266,8 @@ if st.session_state['transcript']:
                 with st.container():
                     if use_card_view:
                         # Modern card-like display
-                        if include_timestamps:
+                        if include_timestamps and show_speakers:
+                            # Full display with timestamps and speakers
                             st.markdown(f"""
                             <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin: 10px 0;">
                                 <div style="display: flex; align-items: center; margin-bottom: 8px;">
@@ -266,10 +279,32 @@ if st.session_state['transcript']:
                                 </div>
                             </div>
                             """, unsafe_allow_html=True)
-                        else:
+                        elif include_timestamps and not show_speakers:
+                            # Only timestamps, no speakers
+                            st.markdown(f"""
+                            <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; margin: 10px 0;">
+                                <div style="display: flex; align-items: center; margin-bottom: 8px;">
+                                    <span style="color: #0066cc; font-weight: bold;">⏰ {start_time} - {end_time}</span>
+                                </div>
+                                <div style="color: #262730; line-height: 1.5;">
+                                    {segment.get('text', 'No text available')}
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        elif not include_timestamps and show_speakers:
+                            # Only speakers, no timestamps
                             st.markdown(f"""
                             <div style="background-color: #f8f9fa; padding: 12px; border-radius: 8px; margin: 8px 0; border-left: 4px solid #ff6b6b;">
                                 <div style="color: #ff6b6b; font-weight: bold; margin-bottom: 5px;">🎤 {speaker}</div>
+                                <div style="color: #262730; line-height: 1.5;">
+                                    {segment.get('text', 'No text available')}
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            # Plain text only
+                            st.markdown(f"""
+                            <div style="background-color: #f9f9f9; padding: 12px; border-radius: 8px; margin: 8px 0;">
                                 <div style="color: #262730; line-height: 1.5;">
                                     {segment.get('text', 'No text available')}
                                 </div>
@@ -280,7 +315,7 @@ if st.session_state['transcript']:
                             st.caption(f"📊 Confidence: {segment.get('confidence', 'N/A')}")
                     else:
                         # Classic column-based display
-                        if include_timestamps:
+                        if include_timestamps and show_speakers:
                             col_time, col_speaker, col_text = st.columns([1.2, 1.2, 3.6])
                             
                             with col_time:
@@ -293,7 +328,15 @@ if st.session_state['transcript']:
                                 st.write(segment.get('text', 'No text available'))
                                 if show_confidence and 'confidence' in segment:
                                     st.caption(f"📊 Confidence: {segment.get('confidence', 'N/A')}")
-                        else:
+                        elif include_timestamps and not show_speakers:
+                            col_time, col_text = st.columns([1, 4])
+                            
+                            with col_time:
+                                st.markdown(f"**⏰ {start_time} - {end_time}**")
+                            
+                            with col_text:
+                                st.write(segment.get('text', 'No text available'))
+                        elif not include_timestamps and show_speakers:
                             col_speaker, col_text = st.columns([1, 5])
                             
                             with col_speaker:
@@ -301,6 +344,9 @@ if st.session_state['transcript']:
                             
                             with col_text:
                                 st.write(segment.get('text', 'No text available'))
+                        else:
+                            # Plain text only
+                            st.write(segment.get('text', 'No text available'))
                         
                         st.divider()
                     
