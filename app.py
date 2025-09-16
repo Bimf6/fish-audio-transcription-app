@@ -101,8 +101,7 @@ def compress_audio_fallback(input_data, target_size_mb=20):
     if current_size_mb <= target_size_mb:
         return input_data
     
-    st.warning("⚠️ FFmpeg not available. Using smart compression fallback.")
-    st.info("💡 For better compression, install FFmpeg: `brew install ffmpeg`")
+    st.info("🔧 Using smart audio optimization (FFmpeg not installed).")
     
     # Try to find MP3 frame boundaries for smarter truncation
     target_bytes = int(target_size_mb * 1024 * 1024)
@@ -129,12 +128,10 @@ def compress_audio_fallback(input_data, target_size_mb=20):
                     chunks.append(input_data[start_pos:end_pos])
             
             result = b''.join(chunks)
-            st.info(f"📄 Smart compression: {current_size_mb:.1f}MB → {len(result)/(1024*1024):.1f}MB")
             return result
     
     # Fallback: simple truncation
     result = input_data[:target_bytes]
-    st.info(f"📄 Basic compression: {current_size_mb:.1f}MB → {len(result)/(1024*1024):.1f}MB")
     return result
 
 def validate_file_size(file_data, filename):
@@ -217,88 +214,36 @@ if uploaded_file is not None:
     
     file_valid, file_info_message = validate_file_size(audio_data, uploaded_file.name)
     
-    # Display file info and compression options
+    # Auto-handle file compression transparently
+    compression_enabled = False
+    target_size = 20  # Default target size
+    
     if file_valid:
         if len(audio_data) > COMPRESSION_THRESHOLD:
-            st.warning(file_info_message)
-            
-            # Auto-enable compression for very large files
-            with st.expander("📦 File Compression (Strongly Recommended)", expanded=True):
-                st.error(f"⚠️ Your file ({get_file_size_str(len(audio_data))}) is very large. Compression is strongly recommended to avoid API limits.")
-                
-                compression_enabled = st.checkbox(
-                    "Enable automatic compression",
-                    value=True,  # Auto-enabled for large files
-                    help="Compress audio to reduce file size while maintaining quality for transcription"
-                )
-                
-                if compression_enabled:
-                    # More aggressive compression for very large files
-                    max_target = min(40, len(audio_data) // (1024 * 1024) // 2)  # Half the original size or 40MB max
-                    target_size = st.slider(
-                        "Target file size (MB)",
-                        min_value=15,
-                        max_value=max_target,
-                        value=min(25, max_target),
-                        help="Aggressive compression needed for very large files"
-                    )
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Original Size", get_file_size_str(len(audio_data)))
-                    with col2:
-                        st.metric("Target Size", f"~{target_size} MB")
-                        
+            st.warning(f"📦 Large file detected ({get_file_size_str(len(audio_data))}). Will automatically compress for optimal processing.")
+            compression_enabled = True
+            # Automatically determine optimal target size
+            file_size_mb = len(audio_data) / (1024 * 1024)
+            if file_size_mb > 80:
+                target_size = 15  # Very aggressive for huge files
+            elif file_size_mb > 60:
+                target_size = 18  # Aggressive for large files
+            else:
+                target_size = 22  # Moderate for medium-large files
         elif len(audio_data) > RECOMMENDED_SIZE:
-            st.warning(file_info_message)
-            
-            # Optional compression for moderately large files
-            with st.expander("📦 File Compression Options (Recommended)"):
-                st.info("💡 Your file is large. Compression can reduce upload time and improve performance.")
-                
-                compression_enabled = st.checkbox(
-                    "Enable automatic compression",
-                    value=len(audio_data) > COMPRESSION_THRESHOLD,  # Auto-enable for very large files
-                    help="Compress audio to reduce file size while maintaining quality for transcription"
-                )
-                
-                if compression_enabled:
-                    target_size = st.slider(
-                        "Target file size (MB)",
-                        min_value=10,
-                        max_value=35,
-                        value=20,
-                        help="Smaller files upload faster but may have slightly reduced audio quality"
-                    )
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Original Size", get_file_size_str(len(audio_data)))
-                    with col2:
-                        st.metric("Target Size", f"~{target_size} MB")
+            st.info(f"📂 Medium file ({get_file_size_str(len(audio_data))}) - will compress if needed.")
+            compression_enabled = True
+            target_size = 25  # Less aggressive for medium files
         else:
             st.success(file_info_message)
     else:
         st.error(file_info_message)
         st.info("💡 Try compressing your audio file using an external tool, or enable compression below.")
         
-        # Offer compression even for oversized files
-        with st.expander("📦 Emergency Compression"):
-            st.warning("⚠️ File exceeds maximum size. Emergency compression may help, but quality may be reduced.")
-            compression_enabled = st.checkbox(
-                "Attempt emergency compression",
-                value=False,
-                help="This will significantly compress the audio and may affect transcription quality"
-            )
-            
-            if compression_enabled:
-                target_size = st.slider(
-                    "Emergency target size (MB)",
-                    min_value=5,
-                    max_value=25,
-                    value=15,
-                    help="Very aggressive compression - use only if necessary"
-                )
+        # Auto-enable emergency compression for oversized files
+        compression_enabled = True
+        target_size = 12  # Very aggressive compression for oversized files
+        st.info("🔧 File exceeds limits. Will attempt emergency compression.")
 
 language = st.selectbox(
     "Select language", 
@@ -350,27 +295,20 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
         try:
             # Prepare audio data with optional compression
             if compression_enabled:
-                with st.spinner("🔄 Compressing audio file..."):
+                with st.spinner("🔄 Optimizing audio file for transcription..."):
                     progress_bar = st.progress(0)
-                    st.info(f"Original size: {get_file_size_str(len(audio_data))}")
-                    
-                    # Set target size based on file validation
-                    if not file_valid:  # Emergency compression
-                        target_size_mb = target_size
-                    else:  # Regular compression
-                        target_size_mb = target_size
                     
                     progress_bar.progress(25)
-                    compressed_data = compress_audio_ffmpeg(audio_data, target_size_mb)
+                    compressed_data = compress_audio_ffmpeg(audio_data, target_size)
                     progress_bar.progress(75)
                     
                     if compressed_data:
                         final_audio_data = compressed_data
                         compression_ratio = len(audio_data) / len(compressed_data)
                         progress_bar.progress(100)
-                        st.success(f"✅ Compression complete! Reduced to {get_file_size_str(len(compressed_data))} ({compression_ratio:.1f}x smaller)")
+                        st.success(f"✅ File optimized: {get_file_size_str(len(audio_data))} → {get_file_size_str(len(compressed_data))}")
                     else:
-                        st.error("❌ Compression failed. Trying with original file...")
+                        st.warning("⚠️ Optimization failed. Using original file...")
                         final_audio_data = audio_data
                     
                     progress_bar.empty()
@@ -408,13 +346,18 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     # Use ormsgpack like the original SDK with longer timeout for large files
                     timeout_seconds = min(180, max(90, len(final_audio_data) // (1024 * 1024) * 3))  # 3 seconds per MB, min 90s, max 180s
                     
-                    # Add retry logic for large files
-                    max_retries = 2
+                    # Robust retry logic for large files and server errors
+                    max_retries = 3
+                    response = None
+                    
                     for attempt in range(max_retries + 1):
                         try:
                             if attempt > 0:
-                                st.warning(f"⏳ Attempt {attempt + 1}/{max_retries + 1} - Large files may take longer...")
-                                upload_progress.progress(30 + (attempt * 20))
+                                wait_time = min(5 + (attempt * 2), 15)  # Progressive wait: 5s, 7s, 9s, max 15s
+                                st.warning(f"🔄 Attempt {attempt + 1}/{max_retries + 1} - Waiting {wait_time}s before retry...")
+                                import time
+                                time.sleep(wait_time)
+                                upload_progress.progress(30 + (attempt * 15))
                             
                             response = requests.post(
                                 url, 
@@ -423,22 +366,26 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                                 timeout=timeout_seconds
                             )
                             
+                            # Check if we got a server error that we should retry
+                            if response.status_code in [500, 502, 503, 504] and attempt < max_retries:
+                                st.warning(f"⚠️ Server error {response.status_code}, retrying...")
+                                timeout_seconds += 20  # Increase timeout for next attempt
+                                continue
+                            
                             upload_progress.progress(100)
                             upload_progress.empty()
-                            break  # Success, exit retry loop
+                            break  # Success or non-retryable error, exit retry loop
                             
                         except requests.exceptions.Timeout:
                             if attempt < max_retries:
-                                st.warning(f"⏰ Upload timed out, retrying... ({attempt + 1}/{max_retries})")
+                                st.warning(f"⏰ Upload timed out, increasing timeout and retrying...")
                                 timeout_seconds += 30  # Increase timeout for retry
                                 continue
                             else:
                                 raise  # Re-raise if all retries failed
                         except requests.exceptions.RequestException as e:
-                            if attempt < max_retries and "500" in str(e):
-                                st.warning(f"🔄 Server error, retrying... ({attempt + 1}/{max_retries})")
-                                import time
-                                time.sleep(2)  # Wait before retry
+                            if attempt < max_retries:
+                                st.warning(f"🔄 Network error, retrying... ({str(e)[:50]})")
                                 continue
                             else:
                                 raise
@@ -474,11 +421,22 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     elif response.status_code == 400:
                         st.error("❌ Bad request. Check if your audio file format is supported.")
                     elif response.status_code == 500:
-                        st.error("🔥 Server error (500) - The API server encountered an issue.")
-                        st.info("💡 This often happens with very large files. Try:")
-                        st.info("• Enable compression to reduce file size")
-                        st.info("• Wait a few minutes and try again")
-                        st.info("• Use a shorter audio file")
+                        st.error("🔥 Server error (500) - The Fish Audio API server encountered an issue.")
+                        st.error("💡 This typically means the file is still too large or complex for processing.")
+                        with st.expander("🔧 Troubleshooting Steps"):
+                            st.markdown("""
+                            **Try these solutions:**
+                            1. **File too large**: Even after compression, your file might be too big
+                            2. **Audio format issue**: Try converting to MP3 format first
+                            3. **File duration**: Very long files (>2 hours) may cause issues
+                            4. **Server capacity**: The API might be overloaded right now
+                            
+                            **Quick fixes:**
+                            - Split your audio into smaller segments (30-60 minutes each)
+                            - Convert to MP3 with lower bitrate using external tools
+                            - Try again in 10-15 minutes when server load is lower
+                            - Use a different audio file to test if the issue persists
+                            """)
                     elif response.status_code == 502 or response.status_code == 503:
                         st.error(f"🔧 Service temporarily unavailable ({response.status_code})")
                         st.info("💡 The Fish Audio service may be busy. Try again in a few minutes.")
