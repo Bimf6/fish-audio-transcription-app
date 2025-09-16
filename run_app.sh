@@ -9,35 +9,36 @@ if [ ! -f "app.py" ]; then
     exit 1
 fi
 
-# Install/update dependencies with fallback
-echo "📦 Installing dependencies..."
+# Force use of Python 3.9 user environment (avoid system Python 3.10)
+export PATH="/Users/ellelammba/Library/Python/3.9/bin:$PATH"
+export PYTHONPATH="/Users/ellelammba/Library/Python/3.9/lib/python/site-packages:$PYTHONPATH"
 
-# Try to install core dependencies with fallback versions
-echo "Installing core packages..."
-python3 -m pip install --user streamlit requests ormsgpack --quiet 2>/dev/null || {
-    echo "⚠️  Installing with older versions for compatibility..."
-    python3 -m pip install --user "streamlit==1.39.0" "requests>=2.28.0" "ormsgpack>=1.4.0" --quiet
+echo "🔧 Setting up environment..."
+echo "Using Python: $(which python3)"
+echo "Python version: $(python3 --version)"
+
+# Ensure we have the right dependencies
+echo "📦 Installing/checking dependencies..."
+python3 -m pip install --user --quiet streamlit==1.39.0 requests ormsgpack 2>/dev/null || {
+    echo "⚠️ Installing dependencies..."
+    python3 -m pip install --user streamlit==1.39.0 requests ormsgpack
 }
 
+# Verify imports work
+if python3 -c "import streamlit, requests, ormsgpack; print('✅ All imports successful')" 2>/dev/null; then
+    echo "✅ Dependencies verified"
+else
+    echo "❌ Dependency verification failed"
+    echo "Trying alternative installation..."
+    python3 -m pip install --user --force-reinstall streamlit==1.39.0
+fi
+
 # Run the app
+echo ""
 echo "🚀 Starting Streamlit app..."
 echo "📱 App will open at: http://localhost:8501"
 echo "💡 Features: Large file support (76MB+), auto-compression, smart error handling"
 echo ""
 
-# Use the Python version that has working Streamlit (3.9 user install)
-echo "Using Python 3 with user packages..."
-export PATH="/Users/ellelammba/Library/Python/3.9/bin:$PATH"
-
-# Try different approaches to run Streamlit
-if python3 -c "import streamlit" 2>/dev/null; then
-    echo "✅ Streamlit found with Python 3"
-    python3 -m streamlit run app.py
-elif /Users/ellelammba/Library/Python/3.9/bin/streamlit --version 2>/dev/null; then
-    echo "✅ Using direct Streamlit binary"
-    /Users/ellelammba/Library/Python/3.9/bin/streamlit run app.py
-else
-    echo "❌ Streamlit not working. Trying to reinstall..."
-    python3 -m pip install --user --force-reinstall streamlit==1.39.0
-    python3 -m streamlit run app.py
-fi 
+# Use the working environment directly
+python3 -m streamlit run app.py --server.address localhost --server.port 8501 

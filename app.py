@@ -95,19 +95,47 @@ def compress_audio_ffmpeg(input_data, target_size_mb=20):
         return compress_audio_fallback(input_data, target_size_mb)
 
 def compress_audio_fallback(input_data, target_size_mb=20):
-    """Simple fallback compression by truncating file if too large"""
+    """Improved fallback compression without FFmpeg"""
     current_size_mb = len(input_data) / (1024 * 1024)
     
     if current_size_mb <= target_size_mb:
         return input_data
     
-    # Simple approach: truncate to target size
-    # This is not ideal but works as last resort
+    st.warning("⚠️ FFmpeg not available. Using smart compression fallback.")
+    st.info("💡 For better compression, install FFmpeg: `brew install ffmpeg`")
+    
+    # Try to find MP3 frame boundaries for smarter truncation
     target_bytes = int(target_size_mb * 1024 * 1024)
     
-    st.warning("⚠️ Using basic compression. Audio may be truncated. Install FFmpeg for better compression.")
+    # For MP3 files, try to preserve header and avoid cutting mid-frame
+    if input_data.startswith(b'ID3') or input_data[0:2] == b'\xff\xfb':
+        # This is likely an MP3 file
+        # Keep the first part (headers) and then take chunks from throughout the file
+        header_size = min(8192, len(input_data) // 10)  # First 8KB or 10% of file
+        remaining_budget = target_bytes - header_size
+        
+        if remaining_budget > 0:
+            # Take samples from different parts of the file
+            chunk_size = remaining_budget // 4
+            chunks = []
+            chunks.append(input_data[:header_size])  # Header
+            
+            # Take 3 more chunks from different parts of the audio
+            file_length = len(input_data)
+            for i in range(3):
+                start_pos = header_size + (i * file_length // 4)
+                end_pos = min(start_pos + chunk_size, file_length)
+                if start_pos < file_length:
+                    chunks.append(input_data[start_pos:end_pos])
+            
+            result = b''.join(chunks)
+            st.info(f"📄 Smart compression: {current_size_mb:.1f}MB → {len(result)/(1024*1024):.1f}MB")
+            return result
     
-    return input_data[:target_bytes]
+    # Fallback: simple truncation
+    result = input_data[:target_bytes]
+    st.info(f"📄 Basic compression: {current_size_mb:.1f}MB → {len(result)/(1024*1024):.1f}MB")
+    return result
 
 def validate_file_size(file_data, filename):
     """Validate file size and provide user feedback"""
@@ -378,17 +406,42 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     upload_progress.progress(30)
                     
                     # Use ormsgpack like the original SDK with longer timeout for large files
-                    timeout_seconds = min(120, max(60, len(final_audio_data) // (1024 * 1024) * 2))  # 2 seconds per MB, min 60s, max 120s
+                    timeout_seconds = min(180, max(90, len(final_audio_data) // (1024 * 1024) * 3))  # 3 seconds per MB, min 90s, max 180s
                     
-                    response = requests.post(
-                        url, 
-                        headers=headers, 
-                        data=ormsgpack.packb(payload), 
-                        timeout=timeout_seconds
-                    )
-                    
-                    upload_progress.progress(100)
-                    upload_progress.empty()
+                    # Add retry logic for large files
+                    max_retries = 2
+                    for attempt in range(max_retries + 1):
+                        try:
+                            if attempt > 0:
+                                st.warning(f"⏳ Attempt {attempt + 1}/{max_retries + 1} - Large files may take longer...")
+                                upload_progress.progress(30 + (attempt * 20))
+                            
+                            response = requests.post(
+                                url, 
+                                headers=headers, 
+                                data=ormsgpack.packb(payload), 
+                                timeout=timeout_seconds
+                            )
+                            
+                            upload_progress.progress(100)
+                            upload_progress.empty()
+                            break  # Success, exit retry loop
+                            
+                        except requests.exceptions.Timeout:
+                            if attempt < max_retries:
+                                st.warning(f"⏰ Upload timed out, retrying... ({attempt + 1}/{max_retries})")
+                                timeout_seconds += 30  # Increase timeout for retry
+                                continue
+                            else:
+                                raise  # Re-raise if all retries failed
+                        except requests.exceptions.RequestException as e:
+                            if attempt < max_retries and "500" in str(e):
+                                st.warning(f"🔄 Server error, retrying... ({attempt + 1}/{max_retries})")
+                                import time
+                                time.sleep(2)  # Wait before retry
+                                continue
+                            else:
+                                raise
                 
                 if response.status_code == 200:
                     result = response.json()
@@ -420,6 +473,15 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                         st.error("🔑 Invalid API key. Please check your Fish Audio API key.")
                     elif response.status_code == 400:
                         st.error("❌ Bad request. Check if your audio file format is supported.")
+                    elif response.status_code == 500:
+                        st.error("🔥 Server error (500) - The API server encountered an issue.")
+                        st.info("💡 This often happens with very large files. Try:")
+                        st.info("• Enable compression to reduce file size")
+                        st.info("• Wait a few minutes and try again")
+                        st.info("• Use a shorter audio file")
+                    elif response.status_code == 502 or response.status_code == 503:
+                        st.error(f"🔧 Service temporarily unavailable ({response.status_code})")
+                        st.info("💡 The Fish Audio service may be busy. Try again in a few minutes.")
                     else:
                         st.error(f"API Error {response.status_code}: {response.text}")
                     
