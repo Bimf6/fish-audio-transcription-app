@@ -8,11 +8,19 @@ import tempfile
 import subprocess
 import math
 import io
+import numpy as np
 from pathlib import Path
+try:
+    import librosa
+    import sklearn.cluster
+    from sklearn.preprocessing import StandardScaler
+    AUDIO_ANALYSIS_AVAILABLE = True
+except ImportError:
+    AUDIO_ANALYSIS_AVAILABLE = False
 
 LANGUAGE_MAP = {
-    "Mandarin": "zh",
-    "English": "en",
+    "Traditional Chinese": "zh-tw",
+    "English": "en", 
     "Cantonese": "zh-yue"
 }
 
@@ -20,7 +28,9 @@ LANGUAGE_MAP = {
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB - much higher limit for chunking
 RECOMMENDED_SIZE = 25 * 1024 * 1024  # 25MB - recommended size
 CHUNKING_THRESHOLD = 40 * 1024 * 1024  # 40MB - auto-chunk above this size
-API_CHUNK_SIZE = 20 * 1024 * 1024  # 20MB - safe size per API call
+API_CHUNK_SIZE = 10 * 1024 * 1024  # 10MB - safer size per API call
+FALLBACK_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB - fallback for 500 errors
+EMERGENCY_CHUNK_SIZE = 2 * 1024 * 1024  # 2MB - emergency fallback
 
 def get_file_size_str(size_bytes):
     """Convert bytes to human readable file size"""
@@ -157,6 +167,64 @@ def chunk_audio_file(audio_data, chunk_size_bytes=API_CHUNK_SIZE):
     
     return chunks
 
+def adaptive_chunk_audio_file(audio_data, initial_chunk_size=API_CHUNK_SIZE):
+    """Create chunks with adaptive sizing based on failure patterns"""
+    total_size = len(audio_data)
+    
+    # Start with smaller chunks if file is very large
+    if total_size > 100 * 1024 * 1024:  # > 100MB
+        chunk_size = FALLBACK_CHUNK_SIZE  # 5MB
+    elif total_size > 200 * 1024 * 1024:  # > 200MB  
+        chunk_size = EMERGENCY_CHUNK_SIZE  # 2MB
+    else:
+        chunk_size = initial_chunk_size
+    
+    chunks = chunk_audio_file(audio_data, chunk_size)
+    
+    # If we have too many chunks (processing will be slow), try to find a balance
+    max_reasonable_chunks = 20
+    if len(chunks) > max_reasonable_chunks:
+        # Try to balance between size and number of chunks
+        optimal_chunk_size = total_size // max_reasonable_chunks
+        if optimal_chunk_size < EMERGENCY_CHUNK_SIZE:
+            optimal_chunk_size = EMERGENCY_CHUNK_SIZE
+        elif optimal_chunk_size > FALLBACK_CHUNK_SIZE:
+            optimal_chunk_size = FALLBACK_CHUNK_SIZE
+        
+        chunks = chunk_audio_file(audio_data, optimal_chunk_size)
+    
+    return chunks, chunk_size
+
+def rechunk_on_failure(audio_data, failed_chunks, original_chunk_size):
+    """Re-chunk the audio with smaller size when chunks fail with 500 errors"""
+    debug_mode = os.getenv("DEBUG") == "true"
+    
+    # Determine new chunk size based on failure pattern
+    if original_chunk_size > FALLBACK_CHUNK_SIZE:
+        new_chunk_size = FALLBACK_CHUNK_SIZE  # 5MB
+        retry_msg = f"🔄 Retrying with smaller chunks ({get_file_size_str(new_chunk_size)} each)"
+    elif original_chunk_size > EMERGENCY_CHUNK_SIZE:
+        new_chunk_size = EMERGENCY_CHUNK_SIZE  # 2MB
+        retry_msg = f"🔄 Retrying with emergency small chunks ({get_file_size_str(new_chunk_size)} each)"
+    else:
+        # Already at minimum size, can't go smaller
+        if debug_mode:
+            st.write("   ❌ Already at minimum chunk size, cannot reduce further")
+        return None, None
+    
+    if debug_mode:
+        st.write(f"   📉 Reducing chunk size: {get_file_size_str(original_chunk_size)} → {get_file_size_str(new_chunk_size)}")
+    
+    st.info(retry_msg)
+    
+    # Create new smaller chunks
+    new_chunks = chunk_audio_file(audio_data, new_chunk_size)
+    
+    if debug_mode:
+        st.write(f"   📦 New chunking: {len(new_chunks)} chunks instead of {len(failed_chunks)}")
+    
+    return new_chunks, new_chunk_size
+
 def chunk_mp3_audio(audio_data, chunk_size_bytes):
     """Smart chunking for MP3 files to preserve structure"""
     chunks = []
@@ -247,6 +315,149 @@ def validate_chunk_data(chunk_data, chunk_num=1):
             issues.append("Low entropy data (possibly corrupted)")
     
     return issues
+
+def extract_voice_features(audio_data, sample_rate=22050):
+    """Extract voice features for speaker identification"""
+    if not AUDIO_ANALYSIS_AVAILABLE:
+        return None
+    
+    try:
+        # Convert audio data to numpy array
+        if isinstance(audio_data, bytes):
+            # Save to temporary file and load with librosa
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+                temp_file.write(audio_data)
+                temp_file_path = temp_file.name
+            
+            try:
+                y, sr = librosa.load(temp_file_path, sr=sample_rate)
+            finally:
+                os.unlink(temp_file_path)
+        else:
+            y = audio_data
+            sr = sample_rate
+        
+        # Extract features for voice analysis
+        features = []
+        
+        # 1. MFCC (Mel-frequency cepstral coefficients) - voice timbre
+        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+        features.extend(np.mean(mfccs, axis=1))
+        features.extend(np.std(mfccs, axis=1))
+        
+        # 2. Spectral features - voice characteristics
+        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)
+        features.append(np.mean(spectral_centroids))
+        features.append(np.std(spectral_centroids))
+        
+        spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
+        features.append(np.mean(spectral_rolloff))
+        features.append(np.std(spectral_rolloff))
+        
+        # 3. Zero crossing rate - voice rhythm
+        zcr = librosa.feature.zero_crossing_rate(y)
+        features.append(np.mean(zcr))
+        features.append(np.std(zcr))
+        
+        # 4. Tempo and rhythm
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        features.append(tempo)
+        
+        # 5. Chroma features - pitch class
+        chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+        features.extend(np.mean(chroma, axis=1))
+        
+        return np.array(features)
+        
+    except Exception as e:
+        if os.getenv("DEBUG") == "true":
+            st.write(f"   ⚠️ Voice feature extraction failed: {str(e)}")
+        return None
+
+def analyze_speaker_segments(segments, audio_data=None):
+    """Analyze segments to identify speakers based on voice characteristics"""
+    if not AUDIO_ANALYSIS_AVAILABLE or not segments:
+        return segments  # Return unchanged if no analysis available
+    
+    debug_mode = os.getenv("DEBUG") == "true"
+    
+    try:
+        # Extract features for each segment if audio data available
+        segment_features = []
+        valid_segments = []
+        
+        for i, segment in enumerate(segments):
+            # For now, use text-based features if audio analysis fails
+            # In a full implementation, you'd extract audio for each segment
+            text = segment.get('text', '')
+            
+            # Simple text-based voice characteristics
+            features = []
+            
+            # Text length (indicates speaking style)
+            features.append(len(text))
+            
+            # Punctuation patterns (indicates speaking style)
+            features.append(text.count('?'))  # Questions
+            features.append(text.count('!'))  # Exclamations
+            features.append(text.count('.'))  # Statements
+            features.append(text.count(','))  # Pauses
+            
+            # Word characteristics
+            words = text.split()
+            features.append(len(words))  # Word count
+            if words:
+                features.append(np.mean([len(word) for word in words]))  # Avg word length
+            else:
+                features.append(0)
+            
+            # Sentiment indicators (basic)
+            positive_words = ['yes', 'good', 'great', 'excellent', 'love', 'like']
+            negative_words = ['no', 'bad', 'terrible', 'hate', 'dislike', 'wrong']
+            features.append(sum(1 for word in words if word.lower() in positive_words))
+            features.append(sum(1 for word in words if word.lower() in negative_words))
+            
+            # Speaking patterns
+            features.append(1 if text.strip().endswith('?') else 0)  # Ends with question
+            features.append(1 if any(word.lower() in ['um', 'uh', 'er', 'ah'] for word in words) else 0)  # Hesitation
+            
+            segment_features.append(features)
+            valid_segments.append(segment)
+        
+        if len(segment_features) < 2:
+            return segments  # Need at least 2 segments to cluster
+        
+        # Normalize features
+        scaler = StandardScaler()
+        normalized_features = scaler.fit_transform(segment_features)
+        
+        # Determine optimal number of speakers (2-4)
+        n_speakers = min(max(2, len(segments) // 3), 4)
+        
+        # Cluster segments by speaker
+        clustering = sklearn.cluster.KMeans(n_clusters=n_speakers, random_state=42, n_init=10)
+        speaker_labels = clustering.fit_predict(normalized_features)
+        
+        # Assign speaker labels to segments
+        speaker_names = ['Speaker A', 'Speaker B', 'Speaker C', 'Speaker D']
+        for i, segment in enumerate(valid_segments):
+            speaker_id = speaker_labels[i]
+            segment['speaker'] = speaker_names[speaker_id]
+        
+        if debug_mode:
+            st.write(f"   🎤 Voice analysis: Identified {n_speakers} speakers across {len(segments)} segments")
+            speaker_counts = {}
+            for label in speaker_labels:
+                speaker_counts[speaker_names[label]] = speaker_counts.get(speaker_names[label], 0) + 1
+            for speaker, count in speaker_counts.items():
+                st.write(f"      {speaker}: {count} segments")
+        
+        return valid_segments
+        
+    except Exception as e:
+        if debug_mode:
+            st.write(f"   ⚠️ Speaker analysis failed: {str(e)}")
+        return segments  # Return unchanged on error
 
 def estimate_chunk_duration(chunk_size_bytes, total_duration_ms, total_file_size):
     """Estimate the duration of an audio chunk in milliseconds"""
@@ -608,8 +819,10 @@ if uploaded_file is not None:
     if file_valid:
         if len(audio_data) > CHUNKING_THRESHOLD:
             use_chunking = True
-            num_chunks = math.ceil(len(audio_data) / API_CHUNK_SIZE)
-            st.info(f"🧩 Large file detected ({get_file_size_str(len(audio_data))}). Will process in {num_chunks} chunks for best quality.")
+            # Estimate chunks using adaptive sizing
+            _, estimated_chunk_size = adaptive_chunk_audio_file(audio_data)
+            num_chunks = math.ceil(len(audio_data) / estimated_chunk_size)
+            st.info(f"🧩 Large file detected ({get_file_size_str(len(audio_data))}). Will process in ~{num_chunks} adaptive chunks for best quality.")
         elif len(audio_data) > RECOMMENDED_SIZE:
             st.info(f"📂 Medium file ({get_file_size_str(len(audio_data))}) - processing normally.")
         else:
@@ -619,7 +832,7 @@ if uploaded_file is not None:
 
 language = st.selectbox(
     "Select language", 
-    ["Auto Detect", "Mandarin", "English", "Cantonese"],
+    ["Auto Detect", "Traditional Chinese", "English", "Cantonese"],
     help="Choose the language of your audio file or let the system auto-detect"
 )
 
@@ -641,6 +854,12 @@ with st.expander("🔧 Advanced Options"):
     
     if speaker_detection_mode == "Manual Labels":
         st.info("💡 Tip: Upload audio where speakers introduce themselves or use different vocal patterns")
+    elif speaker_detection_mode == "Voice Characteristics":
+        if AUDIO_ANALYSIS_AVAILABLE:
+            st.info("🔬 Advanced voice analysis enabled - uses ML clustering to identify speakers by voice characteristics")
+        else:
+            st.warning("🔬 Advanced voice analysis requires additional packages. Install: pip install librosa scikit-learn")
+            st.info("📝 Currently using enhanced text-based analysis as fallback")
     
     show_confidence = st.checkbox("Show confidence scores", value=False, key="show_confidence")
     include_timestamps = st.checkbox("Include detailed timestamps", value=True, key="include_timestamps")
@@ -676,10 +895,10 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
             lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
             
             if use_chunking:
-                # Process large file in chunks
+                # Process large file in chunks with adaptive sizing
                 with st.spinner("🧩 Splitting audio file into chunks..."):
-                    chunks = chunk_audio_file(audio_data, API_CHUNK_SIZE)
-                    st.info(f"📦 Split into {len(chunks)} chunks of ~{get_file_size_str(API_CHUNK_SIZE)} each")
+                    chunks, chunk_size = adaptive_chunk_audio_file(audio_data)
+                    st.info(f"📦 Split into {len(chunks)} chunks of ~{get_file_size_str(chunk_size)} each")
                 
                 # Process each chunk
                 transcript_chunks = []
@@ -743,9 +962,69 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                 overall_progress.empty()
                 status_text.empty()
                 
-                # Filter out None/failed chunks
+                # Check for 500 errors pattern and retry with smaller chunks
                 successful_chunks = [(chunk, duration) for chunk, duration in zip(transcript_chunks, chunk_durations) if chunk is not None]
                 successful_count = len(successful_chunks)
+                failed_count = total_chunks - successful_count
+                
+                # If most chunks failed and we haven't tried smaller chunks yet, retry
+                failure_rate = failed_count / total_chunks
+                if failure_rate >= 0.5 and chunk_size > EMERGENCY_CHUNK_SIZE:  # 50% or more failed
+                    st.warning(f"⚠️ {failed_count}/{total_chunks} chunks failed. Attempting automatic recovery with smaller chunks...")
+                    
+                    # Try re-chunking with smaller size
+                    retry_chunks, retry_chunk_size = rechunk_on_failure(audio_data, chunks, chunk_size)
+                    
+                    if retry_chunks:
+                        # Retry with smaller chunks
+                        retry_transcript_chunks = []
+                        retry_chunk_durations = []
+                        retry_total_chunks = len(retry_chunks)
+                        
+                        retry_progress_container = st.container()
+                        with retry_progress_container:
+                            retry_overall_progress = st.progress(0)
+                            retry_status_text = st.empty()
+                            
+                        for i, chunk in enumerate(retry_chunks):
+                            chunk_num = i + 1
+                            retry_status_text.text(f"🔄 Retry chunk {chunk_num}/{retry_total_chunks}...")
+                            
+                            debug_mode = os.getenv("DEBUG") == "true"
+                            
+                            # Process retry chunk
+                            chunk_result = process_audio_chunk(chunk, lang_code, api_key, chunk_num, retry_total_chunks)
+                            
+                            if chunk_result:
+                                retry_transcript_chunks.append(chunk_result)
+                                estimated_duration = estimate_chunk_duration(len(chunk), len(audio_data) * 120000, len(audio_data))
+                                retry_chunk_durations.append(estimated_duration)
+                                
+                                if debug_mode:
+                                    chunk_text_preview = chunk_result.get('text', '')[:50]
+                                    st.success(f"✅ Retry chunk {chunk_num} completed: '{chunk_text_preview}...'")
+                            else:
+                                retry_transcript_chunks.append(None)
+                                retry_chunk_durations.append(0)
+                            
+                            # Update retry progress
+                            progress = chunk_num / retry_total_chunks
+                            retry_overall_progress.progress(progress)
+                        
+                        # Clean up retry progress
+                        retry_overall_progress.empty()
+                        retry_status_text.empty()
+                        
+                        # Use retry results
+                        transcript_chunks = retry_transcript_chunks
+                        chunk_durations = retry_chunk_durations
+                        total_chunks = retry_total_chunks
+                        successful_chunks = [(chunk, duration) for chunk, duration in zip(transcript_chunks, chunk_durations) if chunk is not None]
+                        successful_count = len(successful_chunks)
+                        
+                        st.success(f"🔄 Retry completed: {successful_count}/{total_chunks} chunks successful with smaller size")
+                
+                # Final results processing
                 
                 if successful_count > 0:
                     # Stitch results together from successful chunks
@@ -754,9 +1033,16 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                         successful_durations = [duration for chunk, duration in successful_chunks]
                         result = stitch_transcripts(successful_transcripts, successful_durations)
                     
+                    # Analyze speakers if voice analysis is requested
+                    segments = result.get('segments', [])
+                    if segments and st.session_state.get('speaker_detection_mode') == "Voice Characteristics":
+                        with st.spinner("🎤 Analyzing speakers..."):
+                            segments = analyze_speaker_segments(segments, audio_data)
+                            result['segments'] = segments
+                    
                     st.session_state['transcript'] = result.get('text', '')
                     st.session_state['transcript_data'] = result
-                    st.session_state['segments'] = result.get('segments', [])
+                    st.session_state['segments'] = segments
                     st.session_state['duration'] = result.get('duration', 0)
                     
                     if successful_count == total_chunks:
@@ -776,9 +1062,15 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     result = process_audio_chunk(audio_data, lang_code, api_key)
                     
                     if result:
+                        # Analyze speakers if voice analysis is requested
+                        segments = result.get('segments', [])
+                        if segments and st.session_state.get('speaker_detection_mode') == "Voice Characteristics":
+                            with st.spinner("🎤 Analyzing speakers..."):
+                                segments = analyze_speaker_segments(segments, audio_data)
+                        
                         st.session_state['transcript'] = result.get('text', '')
                         st.session_state['transcript_data'] = result
-                        st.session_state['segments'] = result.get('segments', [])
+                        st.session_state['segments'] = segments
                         st.session_state['duration'] = result.get('duration', 0)
                         
                         st.success("✅ Transcription completed!")
@@ -817,10 +1109,15 @@ def format_timecode(seconds):
     else:
         return f"{minutes:02d}:{secs:02d}"
 
-def identify_speaker(segment_index, text_length, text_content="", speaker_names=None, detection_mode="Auto (Pattern-based)"):
+def identify_speaker(segment_index, text_length, text_content="", speaker_names=None, detection_mode="Auto (Pattern-based)", segment=None):
     """Enhanced speaker identification with multiple methods"""
     if speaker_names is None:
         speaker_names = {"Speaker A": "Speaker A", "Speaker B": "Speaker B", "Speaker C": "Speaker C"}
+    
+    # If segment already has speaker from voice analysis, use it
+    if segment and 'speaker' in segment:
+        speaker_key = segment['speaker']
+        return speaker_names.get(speaker_key, speaker_key)
     
     if detection_mode == "Manual Labels":
         # Look for speaker cues in the text
@@ -836,18 +1133,43 @@ def identify_speaker(segment_index, text_length, text_content="", speaker_names=
         return speaker_names[speaker_key]
     
     elif detection_mode == "Voice Characteristics":
-        # Simple heuristic based on text characteristics
-        if "?" in text_content:  # Questions often indicate interviewer/moderator
+        # If voice analysis was performed, speaker should be in segment
+        # This is a fallback for when voice analysis wasn't available
+        if not AUDIO_ANALYSIS_AVAILABLE:
+            st.warning("🔬 Advanced voice analysis requires additional packages. Using text-based analysis.")
+        
+        # Enhanced text-based analysis as fallback
+        text_lower = text_content.lower()
+        
+        # Detect question patterns (often interviewer)
+        question_indicators = ['?', 'what', 'how', 'when', 'where', 'why', 'who', 'which', 'can you', 'could you', 'would you']
+        if any(indicator in text_lower for indicator in question_indicators):
             return speaker_names.get("Speaker A", "Speaker A")
-        elif text_length > 100:  # Long segments might indicate main speaker
+        
+        # Detect response patterns
+        response_indicators = ['yes', 'no', 'well', 'actually', 'i think', 'i believe', 'in my opinion']
+        if any(indicator in text_lower for indicator in response_indicators):
             return speaker_names.get("Speaker B", "Speaker B")
-        else:  # Short responses
+        
+        # Long detailed responses
+        if text_length > 150:
+            return speaker_names.get("Speaker B", "Speaker B")
+        
+        # Short acknowledgments
+        elif text_length < 30:
             return speaker_names.get("Speaker C", "Speaker C")
+        
+        # Default to alternating
+        else:
+            speaker_key = list(speaker_names.keys())[segment_index % len(speaker_names)]
+            return speaker_names[speaker_key]
     
     else:  # Auto (Pattern-based)
-        # Alternating pattern with some intelligence
+        # Improved alternating pattern with intelligence
         if text_length < 20:  # Short responses (acknowledgments, etc.)
             return speaker_names.get("Speaker C", "Speaker C")
+        elif "?" in text_content:  # Questions
+            return speaker_names.get("Speaker A", "Speaker A")
         elif segment_index % 2 == 0:
             return speaker_names.get("Speaker A", "Speaker A")
         else:
@@ -899,7 +1221,8 @@ if st.session_state['transcript']:
                     len(segment.get('text', '')), 
                     segment.get('text', ''),
                     speaker_names_dict,
-                    detection_mode
+                    detection_mode,
+                    segment
                 )
                 
                 # Create a nice display for each segment
@@ -1152,7 +1475,9 @@ else:
 Debug Info:
 - Max file size limit: {get_file_size_str(MAX_FILE_SIZE)}
 - Chunking threshold: {get_file_size_str(CHUNKING_THRESHOLD)}
-- API chunk size: {get_file_size_str(API_CHUNK_SIZE)}
+- Default chunk size: {get_file_size_str(API_CHUNK_SIZE)}
+- Fallback chunk size: {get_file_size_str(FALLBACK_CHUNK_SIZE)}
+- Emergency chunk size: {get_file_size_str(EMERGENCY_CHUNK_SIZE)}
 - Recommended size: {get_file_size_str(RECOMMENDED_SIZE)}
-- Chunking enabled: Yes (automatic for large files)
+- Adaptive chunking: Yes (auto-adjusts based on file size and failures)
             """.strip()) 

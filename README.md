@@ -6,7 +6,7 @@ A powerful Streamlit web application for advanced audio transcription with speak
 
 ### Core Transcription
 - 🎤 Upload audio files (MP3, WAV, M4A, FLAC)
-- 🌍 Multi-language support (Auto-detect, Mandarin, English, Cantonese)
+- 🌍 Multi-language support (Auto-detect, Traditional Chinese, English, Cantonese)
 - ⚡ Fast, accurate transcription using Fish Audio API
 - 🔐 Secure API key management
 

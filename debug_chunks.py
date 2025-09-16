@@ -12,7 +12,8 @@ from pathlib import Path
 
 # Add the current directory to path so we can import from app.py
 sys.path.append('.')
-from app import chunk_audio_file, validate_chunk_data, API_CHUNK_SIZE, get_file_size_str
+from app import (chunk_audio_file, adaptive_chunk_audio_file, validate_chunk_data, 
+                 API_CHUNK_SIZE, FALLBACK_CHUNK_SIZE, EMERGENCY_CHUNK_SIZE, get_file_size_str)
 
 def test_chunk_processing(file_path, api_key=None):
     """Test chunk processing on a real audio file"""
@@ -29,11 +30,23 @@ def test_chunk_processing(file_path, api_key=None):
     
     print(f"📁 Original file size: {get_file_size_str(len(audio_data))}")
     
-    # Test chunking
-    print(f"\n🧩 Testing chunking with {get_file_size_str(API_CHUNK_SIZE)} chunks...")
+    # Test adaptive chunking
+    print(f"\n🧩 Testing adaptive chunking...")
     try:
-        chunks = chunk_audio_file(audio_data, API_CHUNK_SIZE)
-        print(f"✅ Successfully created {len(chunks)} chunks")
+        chunks, chunk_size = adaptive_chunk_audio_file(audio_data)
+        print(f"✅ Adaptive chunking: {len(chunks)} chunks of {get_file_size_str(chunk_size)} each")
+        
+        # Also test standard chunking for comparison
+        print(f"\n📊 Comparison with standard chunking ({get_file_size_str(API_CHUNK_SIZE)}):")
+        standard_chunks = chunk_audio_file(audio_data, API_CHUNK_SIZE)
+        print(f"   Standard: {len(standard_chunks)} chunks")
+        print(f"   Adaptive: {len(chunks)} chunks")
+        
+        # Show chunk size recommendations
+        if len(audio_data) > 100 * 1024 * 1024:
+            print(f"   💡 Large file detected - using {get_file_size_str(FALLBACK_CHUNK_SIZE)} chunks")
+        elif len(audio_data) > 200 * 1024 * 1024:
+            print(f"   💡 Very large file detected - using {get_file_size_str(EMERGENCY_CHUNK_SIZE)} chunks")
         
         for i, chunk in enumerate(chunks):
             chunk_num = i + 1
