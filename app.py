@@ -164,29 +164,54 @@ def chunk_mp3_audio(audio_data, chunk_size_bytes):
     
     # Find the end of ID3 tag if present
     header_end = 0
-    if audio_data.startswith(b'ID3'):
-        # ID3v2 tag - skip it for better chunking
-        if len(audio_data) > 10:
-            # Get tag size from header
-            tag_size = (audio_data[6] << 21) | (audio_data[7] << 14) | (audio_data[8] << 7) | audio_data[9]
-            header_end = tag_size + 10
+    if audio_data.startswith(b'ID3') and len(audio_data) > 10:
+        try:
+            # ID3v2 tag - get size more safely
+            size_bytes = audio_data[6:10]
+            if len(size_bytes) == 4:
+                # Decode synchsafe integer
+                tag_size = 0
+                for byte in size_bytes:
+                    tag_size = (tag_size << 7) | (byte & 0x7F)
+                header_end = min(tag_size + 10, total_size // 2)  # Safety limit
+        except:
+            # If ID3 parsing fails, fall back to simple chunking
+            header_end = 0
     
-    # Keep the header with the first chunk
-    remaining_data = audio_data[header_end:]
+    # Ensure we don't split into too many tiny pieces
+    if header_end > chunk_size_bytes // 2:
+        header_end = 0  # Skip complex header if it's too large
+    
+    # Simple chunking approach that's more reliable
     current_pos = 0
+    chunk_num = 0
     
-    while current_pos < len(remaining_data):
-        chunk_end = min(current_pos + chunk_size_bytes, len(remaining_data))
+    while current_pos < total_size:
+        chunk_start = current_pos
+        chunk_end = min(current_pos + chunk_size_bytes, total_size)
         
-        if current_pos == 0:
-            # First chunk - include the header
-            chunk = audio_data[:header_end] + remaining_data[current_pos:chunk_end]
+        # For first chunk, include any header
+        if chunk_num == 0 and header_end > 0:
+            # Make sure first chunk includes header but isn't too big
+            if header_end + (chunk_size_bytes - header_end) <= chunk_size_bytes:
+                chunk = audio_data[0:chunk_end]
+                current_pos = chunk_end
+            else:
+                # Header too big, just use simple chunking
+                chunk = audio_data[chunk_start:chunk_end]
+                current_pos = chunk_end
         else:
-            # Subsequent chunks - just the data
-            chunk = remaining_data[current_pos:chunk_end]
+            chunk = audio_data[chunk_start:chunk_end]
+            current_pos = chunk_end
         
-        chunks.append(chunk)
-        current_pos = chunk_end
+        if len(chunk) > 0:  # Only add non-empty chunks
+            chunks.append(chunk)
+        
+        chunk_num += 1
+        
+        # Safety break to prevent infinite loops
+        if chunk_num > 50:  # Max 50 chunks
+            break
     
     return chunks
 
@@ -236,6 +261,27 @@ def stitch_transcripts(transcript_chunks, chunk_durations):
 def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunks=1):
     """Process a single audio chunk and return the transcript result"""
     try:
+        # Debug chunk information
+        chunk_size_mb = len(chunk_data) / (1024 * 1024)
+        if os.getenv("DEBUG") == "true":
+            st.write(f"🔍 Debug Chunk {chunk_num}: {chunk_size_mb:.1f}MB")
+        
+        # Validate chunk data
+        if len(chunk_data) == 0:
+            if total_chunks > 1:
+                st.error(f"❌ Chunk {chunk_num} is empty")
+            else:
+                st.error("❌ Audio file is empty")
+            return None
+        
+        # Check if chunk is too large even for individual processing
+        if len(chunk_data) > 50 * 1024 * 1024:  # 50MB
+            if total_chunks > 1:
+                st.error(f"❌ Chunk {chunk_num} is still too large ({chunk_size_mb:.1f}MB)")
+            else:
+                st.error(f"❌ File is too large ({chunk_size_mb:.1f}MB) even for chunking")
+            return None
+        
         # Direct API call to Fish Audio
         url = "https://api.fish.audio/v1/asr"
         headers = {
@@ -251,54 +297,96 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
         if lang_code:
             payload["language"] = lang_code
         
-        # Shorter timeout for individual chunks
-        timeout_seconds = 120  # 2 minutes per chunk should be enough
+        # Shorter timeout for individual chunks, but longer for larger chunks
+        base_timeout = 60
+        size_timeout = int(chunk_size_mb * 5)  # 5 seconds per MB
+        timeout_seconds = min(base_timeout + size_timeout, 180)  # Max 3 minutes
         
         # Retry logic for individual chunks
         max_retries = 2
+        last_error = None
+        
         for attempt in range(max_retries + 1):
             try:
                 if attempt > 0:
                     import time
                     wait_time = 3 + attempt  # 3s, 4s
+                    if total_chunks > 1:
+                        st.warning(f"🔄 Retrying chunk {chunk_num} (attempt {attempt + 1})")
                     time.sleep(wait_time)
+                
+                # Pack the payload
+                packed_payload = ormsgpack.packb(payload)
                 
                 response = requests.post(
                     url, 
                     headers=headers, 
-                    data=ormsgpack.packb(payload), 
+                    data=packed_payload, 
                     timeout=timeout_seconds
                 )
                 
+                # Log response details for debugging
+                if os.getenv("DEBUG") == "true":
+                    st.write(f"🔍 Chunk {chunk_num} response: {response.status_code}")
+                
                 # Check for server errors
-                if response.status_code in [500, 502, 503, 504] and attempt < max_retries:
-                    continue
+                if response.status_code in [500, 502, 503, 504]:
+                    last_error = f"Server error {response.status_code}: {response.text[:100]}"
+                    if attempt < max_retries:
+                        continue
+                    else:
+                        if total_chunks > 1:
+                            st.error(f"❌ Chunk {chunk_num} failed: {last_error}")
+                        else:
+                            show_api_error(response.status_code, response.text)
+                        return None
                 
                 if response.status_code == 200:
-                    return response.json()
+                    result = response.json()
+                    if os.getenv("DEBUG") == "true":
+                        st.write(f"✅ Chunk {chunk_num} success: {len(result.get('text', ''))} chars")
+                    return result
                 else:
-                    if chunk_num == 1 and total_chunks == 1:
-                        # Show detailed error for single file processing
+                    last_error = f"API error {response.status_code}: {response.text[:100]}"
+                    if total_chunks > 1:
+                        st.error(f"❌ Chunk {chunk_num} failed: {last_error}")
+                    else:
                         show_api_error(response.status_code, response.text)
                     return None
                     
             except requests.exceptions.Timeout:
+                last_error = f"Timeout after {timeout_seconds}s"
                 if attempt < max_retries:
+                    timeout_seconds += 30  # Increase timeout for retry
                     continue
                 else:
-                    if chunk_num == 1 and total_chunks == 1:
+                    if total_chunks > 1:
+                        st.error(f"❌ Chunk {chunk_num} timed out: {last_error}")
+                    else:
                         st.error("⏰ Request timed out. Please try with a smaller audio file.")
                     return None
             except requests.exceptions.RequestException as e:
+                last_error = f"Network error: {str(e)[:100]}"
                 if attempt < max_retries:
                     continue
                 else:
-                    if chunk_num == 1 and total_chunks == 1:
+                    if total_chunks > 1:
+                        st.error(f"❌ Chunk {chunk_num} network error: {last_error}")
+                    else:
                         st.error(f"🔄 Network error: {str(e)}")
                     return None
+            except Exception as e:
+                last_error = f"Unexpected error: {str(e)[:100]}"
+                if total_chunks > 1:
+                    st.error(f"❌ Chunk {chunk_num} error: {last_error}")
+                else:
+                    st.error(f"❌ Error during transcription: {str(e)}")
+                return None
                     
     except Exception as e:
-        if chunk_num == 1 and total_chunks == 1:
+        if total_chunks > 1:
+            st.error(f"❌ Chunk {chunk_num} processing error: {str(e)}")
+        else:
             st.error(f"❌ Error during transcription: {str(e)}")
         return None
 
@@ -460,6 +548,14 @@ with st.expander("🔧 Advanced Options"):
     include_timestamps = st.checkbox("Include detailed timestamps", value=True, key="include_timestamps")
     use_card_view = st.checkbox("Use modern card layout", value=True, key="use_card_view")
     
+    # Debug mode toggle
+    debug_mode = st.checkbox("Enable debug mode", value=False, key="debug_mode", help="Shows detailed processing information")
+    if debug_mode:
+        os.environ["DEBUG"] = "true"
+        st.info("🔍 Debug mode enabled - detailed processing info will be shown")
+    else:
+        os.environ.pop("DEBUG", None)
+    
     # Speaker customization
     st.write("**Speaker Labels:**")
     speaker_names = {}
@@ -497,42 +593,75 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     overall_progress = st.progress(0)
                     status_text = st.empty()
                     
-                    for i, chunk in enumerate(chunks):
-                        chunk_num = i + 1
-                        status_text.text(f"🎤 Processing chunk {chunk_num}/{total_chunks}...")
-                        
-                        # Process individual chunk
-                        chunk_result = process_audio_chunk(chunk, lang_code, api_key, chunk_num, total_chunks)
-                        
-                        if chunk_result:
-                            transcript_chunks.append(chunk_result)
-                            # Estimate duration based on chunk size
-                            estimated_duration = estimate_chunk_duration(len(chunk), len(audio_data) * 30000, len(audio_data))  # Assume 30s per MB
-                            chunk_durations.append(estimated_duration)
-                        else:
-                            st.error(f"❌ Failed to process chunk {chunk_num}")
-                            break
-                        
-                        # Update progress
-                        progress = (chunk_num) / total_chunks
-                        overall_progress.progress(progress)
+                for i, chunk in enumerate(chunks):
+                    chunk_num = i + 1
+                    status_text.text(f"🎤 Processing chunk {chunk_num}/{total_chunks}...")
                     
-                    overall_progress.empty()
-                    status_text.empty()
+                    # Validate chunk before processing
+                    if len(chunk) == 0:
+                        st.error(f"❌ Chunk {chunk_num} is empty, skipping...")
+                        continue
+                    
+                    if len(chunk) > 50 * 1024 * 1024:  # 50MB safety check
+                        st.error(f"❌ Chunk {chunk_num} is too large ({get_file_size_str(len(chunk))}), skipping...")
+                        continue
+                    
+                    # Process individual chunk with debug info
+                    if os.getenv("DEBUG") == "true":
+                        st.write(f"🔍 Processing chunk {chunk_num}: {get_file_size_str(len(chunk))}")
+                    
+                    chunk_result = process_audio_chunk(chunk, lang_code, api_key, chunk_num, total_chunks)
+                    
+                    if chunk_result:
+                        transcript_chunks.append(chunk_result)
+                        # Estimate duration based on chunk size (more conservative estimate)
+                        estimated_duration = estimate_chunk_duration(len(chunk), len(audio_data) * 120000, len(audio_data))  # Assume 120s per MB (2 minutes)
+                        chunk_durations.append(estimated_duration)
+                        
+                        # Show success for this chunk
+                        chunk_text_preview = chunk_result.get('text', '')[:50]
+                        if os.getenv("DEBUG") == "true":
+                            st.success(f"✅ Chunk {chunk_num} completed: '{chunk_text_preview}...'")
+                    else:
+                        st.error(f"❌ Failed to process chunk {chunk_num}/{total_chunks}")
+                        # Continue with other chunks instead of breaking completely
+                        transcript_chunks.append(None)  # Placeholder
+                        chunk_durations.append(0)  # No duration for failed chunk
+                    
+                    # Update progress
+                    progress = chunk_num / total_chunks
+                    overall_progress.progress(progress)
                 
-                if len(transcript_chunks) == total_chunks:
-                    # Stitch results together
+                # Clean up progress indicators
+                overall_progress.empty()
+                status_text.empty()
+                
+                # Filter out None/failed chunks
+                successful_chunks = [(chunk, duration) for chunk, duration in zip(transcript_chunks, chunk_durations) if chunk is not None]
+                successful_count = len(successful_chunks)
+                
+                if successful_count > 0:
+                    # Stitch results together from successful chunks
                     with st.spinner("🔗 Combining transcripts..."):
-                        result = stitch_transcripts(transcript_chunks, chunk_durations)
+                        successful_transcripts = [chunk for chunk, duration in successful_chunks]
+                        successful_durations = [duration for chunk, duration in successful_chunks]
+                        result = stitch_transcripts(successful_transcripts, successful_durations)
                     
                     st.session_state['transcript'] = result.get('text', '')
                     st.session_state['transcript_data'] = result
                     st.session_state['segments'] = result.get('segments', [])
                     st.session_state['duration'] = result.get('duration', 0)
                     
-                    st.success(f"✅ Transcription completed! Processed {total_chunks} chunks successfully.")
+                    if successful_count == total_chunks:
+                        st.success(f"✅ Transcription completed! Processed all {total_chunks} chunks successfully.")
+                    else:
+                        st.warning(f"⚠️ Partial success: {successful_count}/{total_chunks} chunks processed. Some content may be missing.")
+                        st.info("💡 The transcript contains the successfully processed portions of your audio.")
                 else:
-                    st.error("❌ Some chunks failed to process. Please try again.")
+                    st.error("❌ All chunks failed to process. Please try again with a different file or check your API key.")
+                    st.session_state['transcript'] = ""
+                    st.session_state['transcript_data'] = None
+                    st.session_state['segments'] = []
                     
             else:
                 # Process normally for smaller files
