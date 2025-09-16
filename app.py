@@ -215,6 +215,39 @@ def chunk_mp3_audio(audio_data, chunk_size_bytes):
     
     return chunks
 
+def validate_chunk_data(chunk_data, chunk_num=1):
+    """Validate that chunk data is likely to be processable audio"""
+    issues = []
+    
+    # Size checks
+    if len(chunk_data) == 0:
+        issues.append("Empty chunk")
+    elif len(chunk_data) < 100:
+        issues.append(f"Very small chunk ({len(chunk_data)} bytes)")
+    elif len(chunk_data) > 50 * 1024 * 1024:
+        issues.append(f"Chunk too large ({len(chunk_data) / (1024*1024):.1f}MB)")
+    
+    # Basic format validation
+    if len(chunk_data) >= 4:
+        # Check for common audio format signatures
+        if chunk_data.startswith(b'ID3'):
+            # MP3 with ID3 tag - good
+            pass
+        elif chunk_data.startswith(b'RIFF'):
+            # WAV/RIFF format - good
+            pass
+        elif chunk_data.startswith(b'\xff\xfb') or chunk_data.startswith(b'\xff\xfa'):
+            # MP3 frame start - good
+            pass
+        elif chunk_data.startswith(b'\x00\x00\x00'):
+            # Lots of zeros - might be corrupted
+            issues.append("Chunk starts with zeros (possibly corrupted)")
+        elif len(set(chunk_data[:100])) < 10:
+            # Very low entropy in first 100 bytes
+            issues.append("Low entropy data (possibly corrupted)")
+    
+    return issues
+
 def estimate_chunk_duration(chunk_size_bytes, total_duration_ms, total_file_size):
     """Estimate the duration of an audio chunk in milliseconds"""
     if total_file_size == 0:
@@ -263,29 +296,57 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
     try:
         # Debug chunk information
         chunk_size_mb = len(chunk_data) / (1024 * 1024)
-        if os.getenv("DEBUG") == "true":
+        debug_mode = os.getenv("DEBUG") == "true"
+        
+        if debug_mode:
             st.write(f"🔍 Debug Chunk {chunk_num}: {chunk_size_mb:.1f}MB")
+            # Show chunk header info
+            if len(chunk_data) > 10:
+                header_preview = chunk_data[:10].hex()
+                st.write(f"   Header: {header_preview}")
+                if chunk_data.startswith(b'ID3'):
+                    st.write("   Format: MP3 with ID3 tag")
+                elif chunk_data.startswith(b'RIFF'):
+                    st.write("   Format: WAV/RIFF")
+                elif chunk_data.startswith(b'\xff\xfb') or chunk_data.startswith(b'\xff\xfa'):
+                    st.write("   Format: MP3 frame")
+                else:
+                    st.write("   Format: Unknown/Raw audio")
         
         # Validate chunk data
         if len(chunk_data) == 0:
-            if total_chunks > 1:
-                st.error(f"❌ Chunk {chunk_num} is empty")
-            else:
-                st.error("❌ Audio file is empty")
+            error_msg = f"❌ Chunk {chunk_num} is empty" if total_chunks > 1 else "❌ Audio file is empty"
+            st.error(error_msg)
+            if debug_mode:
+                st.write(f"   Error: Zero bytes in chunk {chunk_num}")
             return None
         
         # Check if chunk is too large even for individual processing
         if len(chunk_data) > 50 * 1024 * 1024:  # 50MB
-            if total_chunks > 1:
-                st.error(f"❌ Chunk {chunk_num} is still too large ({chunk_size_mb:.1f}MB)")
-            else:
-                st.error(f"❌ File is too large ({chunk_size_mb:.1f}MB) even for chunking")
+            error_msg = f"❌ Chunk {chunk_num} is still too large ({chunk_size_mb:.1f}MB)" if total_chunks > 1 else f"❌ File is too large ({chunk_size_mb:.1f}MB) even for chunking"
+            st.error(error_msg)
+            if debug_mode:
+                st.write(f"   Error: Chunk {chunk_num} exceeds 50MB limit")
+            return None
+        
+        # Check for minimum viable chunk size
+        if len(chunk_data) < 1024:  # Less than 1KB
+            if debug_mode:
+                st.warning(f"⚠️ Chunk {chunk_num} is very small ({len(chunk_data)} bytes)")
+            # Continue processing, but flag as potentially problematic
+        
+        # Validate API key
+        if not api_key or len(api_key.strip()) < 10:
+            error_msg = f"❌ Invalid API key for chunk {chunk_num}" if total_chunks > 1 else "❌ Invalid API key"
+            st.error(error_msg)
+            if debug_mode:
+                st.write(f"   Error: API key length {len(api_key) if api_key else 0}")
             return None
         
         # Direct API call to Fish Audio
         url = "https://api.fish.audio/v1/asr"
         headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {api_key.strip()}",
             "Content-Type": "application/msgpack"
         }
         
@@ -297,10 +358,17 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
         if lang_code:
             payload["language"] = lang_code
         
+        if debug_mode:
+            st.write(f"   Payload keys: {list(payload.keys())}")
+            st.write(f"   Language: {lang_code or 'auto-detect'}")
+        
         # Shorter timeout for individual chunks, but longer for larger chunks
         base_timeout = 60
         size_timeout = int(chunk_size_mb * 5)  # 5 seconds per MB
         timeout_seconds = min(base_timeout + size_timeout, 180)  # Max 3 minutes
+        
+        if debug_mode:
+            st.write(f"   Timeout: {timeout_seconds}s")
         
         # Retry logic for individual chunks
         max_retries = 2
@@ -312,11 +380,25 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
                     import time
                     wait_time = 3 + attempt  # 3s, 4s
                     if total_chunks > 1:
-                        st.warning(f"🔄 Retrying chunk {chunk_num} (attempt {attempt + 1})")
+                        st.warning(f"🔄 Retrying chunk {chunk_num} (attempt {attempt + 1}/{max_retries + 1})")
+                    elif debug_mode:
+                        st.write(f"   Retry attempt {attempt + 1}")
                     time.sleep(wait_time)
                 
                 # Pack the payload
-                packed_payload = ormsgpack.packb(payload)
+                try:
+                    packed_payload = ormsgpack.packb(payload)
+                    if debug_mode:
+                        st.write(f"   Packed payload size: {len(packed_payload)} bytes")
+                except Exception as pack_error:
+                    last_error = f"Payload packing error: {str(pack_error)}"
+                    if debug_mode:
+                        st.error(f"   ❌ Packing failed: {last_error}")
+                    continue
+                
+                # Make the API request
+                if debug_mode:
+                    st.write(f"   🌐 Making API request to {url}")
                 
                 response = requests.post(
                     url, 
@@ -326,30 +408,46 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
                 )
                 
                 # Log response details for debugging
-                if os.getenv("DEBUG") == "true":
-                    st.write(f"🔍 Chunk {chunk_num} response: {response.status_code}")
+                if debug_mode:
+                    st.write(f"   📡 Response: {response.status_code}")
+                    st.write(f"   📏 Response size: {len(response.content)} bytes")
+                    if hasattr(response, 'headers') and 'content-type' in response.headers:
+                        st.write(f"   📄 Content-Type: {response.headers['content-type']}")
                 
                 # Check for server errors
                 if response.status_code in [500, 502, 503, 504]:
-                    last_error = f"Server error {response.status_code}: {response.text[:100]}"
+                    last_error = f"Server error {response.status_code}: {response.text[:200]}"
+                    if debug_mode:
+                        st.write(f"   ⚠️ Server error details: {last_error}")
                     if attempt < max_retries:
                         continue
                     else:
                         if total_chunks > 1:
-                            st.error(f"❌ Chunk {chunk_num} failed: {last_error}")
+                            st.error(f"❌ Chunk {chunk_num} failed after {max_retries + 1} attempts: {last_error}")
                         else:
                             show_api_error(response.status_code, response.text)
                         return None
                 
                 if response.status_code == 200:
-                    result = response.json()
-                    if os.getenv("DEBUG") == "true":
-                        st.write(f"✅ Chunk {chunk_num} success: {len(result.get('text', ''))} chars")
-                    return result
+                    try:
+                        result = response.json()
+                        if debug_mode:
+                            st.write(f"   ✅ Success: {len(result.get('text', ''))} chars transcribed")
+                            if 'segments' in result:
+                                st.write(f"   📊 Segments: {len(result['segments'])}")
+                        return result
+                    except Exception as json_error:
+                        last_error = f"JSON parsing error: {str(json_error)}"
+                        if debug_mode:
+                            st.error(f"   ❌ JSON parsing failed: {last_error}")
+                            st.write(f"   Raw response: {response.text[:500]}")
+                        continue
                 else:
-                    last_error = f"API error {response.status_code}: {response.text[:100]}"
+                    last_error = f"API error {response.status_code}: {response.text[:200]}"
+                    if debug_mode:
+                        st.write(f"   ❌ API error details: {last_error}")
                     if total_chunks > 1:
-                        st.error(f"❌ Chunk {chunk_num} failed: {last_error}")
+                        st.error(f"❌ Chunk {chunk_num} failed: HTTP {response.status_code}")
                     else:
                         show_api_error(response.status_code, response.text)
                     return None
@@ -597,18 +695,27 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     chunk_num = i + 1
                     status_text.text(f"🎤 Processing chunk {chunk_num}/{total_chunks}...")
                     
-                    # Validate chunk before processing
-                    if len(chunk) == 0:
-                        st.error(f"❌ Chunk {chunk_num} is empty, skipping...")
-                        continue
+                    debug_mode = os.getenv("DEBUG") == "true"
                     
-                    if len(chunk) > 50 * 1024 * 1024:  # 50MB safety check
-                        st.error(f"❌ Chunk {chunk_num} is too large ({get_file_size_str(len(chunk))}), skipping...")
-                        continue
+                    # Validate chunk before processing
+                    chunk_issues = validate_chunk_data(chunk, chunk_num)
+                    if chunk_issues:
+                        if debug_mode:
+                            st.warning(f"⚠️ Chunk {chunk_num} validation issues: {', '.join(chunk_issues)}")
+                        
+                        # Skip chunks with critical issues
+                        critical_issues = [issue for issue in chunk_issues if "Empty" in issue or "too large" in issue]
+                        if critical_issues:
+                            st.error(f"❌ Chunk {chunk_num} has critical issues: {', '.join(critical_issues)}, skipping...")
+                            transcript_chunks.append(None)
+                            chunk_durations.append(0)
+                            continue
                     
                     # Process individual chunk with debug info
-                    if os.getenv("DEBUG") == "true":
+                    if debug_mode:
                         st.write(f"🔍 Processing chunk {chunk_num}: {get_file_size_str(len(chunk))}")
+                        if not chunk_issues:
+                            st.write(f"   ✅ Chunk validation passed")
                     
                     chunk_result = process_audio_chunk(chunk, lang_code, api_key, chunk_num, total_chunks)
                     
