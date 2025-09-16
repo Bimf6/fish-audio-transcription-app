@@ -139,23 +139,33 @@ if os.getenv("DEBUG") == "true":
         st.sidebar.write("❌ ormsgpack failed")
 
 # API Key configuration
-# Try to get API key from Streamlit secrets first, then environment variables, then default
-default_api_key = ""
-try:
-    if hasattr(st, 'secrets') and "FISH_AUDIO_API_KEY" in st.secrets:
-        default_api_key = st.secrets["FISH_AUDIO_API_KEY"]
-    else:
-        default_api_key = os.getenv("FISH_AUDIO_API_KEY", "")
-except Exception as e:
-    st.error(f"Error loading secrets: {e}")
-    default_api_key = os.getenv("FISH_AUDIO_API_KEY", "")
+st.sidebar.markdown("### 🔑 Fish Audio API Key")
+st.sidebar.markdown("""
+**Required:** Get your API key from [Fish Audio](https://fish.audio)
+- Sign up/login to Fish Audio
+- Go to your account settings
+- Generate an API key
+- Paste it below
+""")
 
 api_key = st.sidebar.text_input(
-    "API Key", 
-    value=default_api_key,
+    "Enter your Fish Audio API Key", 
+    value="",
     type="password",
-    help="Enter your Fish Audio API key. For security, use the Streamlit Cloud secrets manager in production."
+    placeholder="Enter your API key here...",
+    help="Your API key is required to use the transcription service. It's not stored anywhere and only used for this session."
 )
+
+st.sidebar.markdown("🔒 **Privacy**: Your API key is only used for this session and is never stored or logged.")
+
+# API key validation
+if api_key:
+    if len(api_key) < 10:
+        st.sidebar.warning("⚠️ API key seems too short. Please check your key.")
+    else:
+        st.sidebar.success("✅ API key entered")
+else:
+    st.sidebar.error("❌ API key required to proceed")
 
 uploaded_file = st.file_uploader(
     "Upload audio file", 
@@ -274,7 +284,7 @@ if 'transcript' not in st.session_state:
     st.session_state['transcript_data'] = None
     st.session_state['duration'] = 0
 
-if st.button("Transcribe", type="primary", disabled=not uploaded_file or not file_valid):
+if st.button("Transcribe", type="primary", disabled=not uploaded_file or not file_valid or not api_key):
     if uploaded_file is not None and api_key and file_valid:
         try:
             # Prepare audio data with optional compression
@@ -393,9 +403,10 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
             st.error(f"Error during transcription: {str(e)}")
             st.session_state['transcript'] = ""
     elif not api_key:
-        st.error("Please enter your API key in the sidebar.")
+        st.error("🔑 Please enter your Fish Audio API key in the sidebar to continue.")
+        st.info("💡 Don't have an API key? Get one free at [Fish Audio](https://fish.audio)")
     else:
-        st.warning("Please upload an audio file.")
+        st.warning("📁 Please upload an audio file to transcribe.")
 
 # Helper functions for timecode and speaker identification
 def format_timecode(seconds):
@@ -701,17 +712,30 @@ if st.session_state['transcript']:
             )
 
 else:
-    st.info("Upload an audio file and click 'Transcribe' to get started.")
-    st.markdown("""
-    ### 🎯 Features:
-    - **🎤 Speaker Identification**: Automatically identifies different speakers
-    - **⏰ Timecodes**: Shows when each segment was spoken
-    - **📊 Audio Analysis**: Duration and segment statistics
-    - **📥 Multiple Export Formats**: Text, SRT subtitles, JSON data
-    - **🌍 Multi-language Support**: Auto-detect or specify language
-    - **📦 Smart Compression**: Automatically handles large files (up to 76MB+)
-    - **🛡️ Error Handling**: Intelligent retry and fallback mechanisms
-    """)
+    st.info("🚀 Welcome to Fish Audio Transcription! Follow these steps to get started:")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        ### 📋 Getting Started:
+        1. **🔑 Get API Key**: Sign up at [Fish Audio](https://fish.audio) and get your free API key
+        2. **🔐 Enter API Key**: Paste your API key in the sidebar
+        3. **📁 Upload Audio**: Choose your audio file (supports large files up to 76MB+)
+        4. **🎵 Transcribe**: Click the transcribe button and wait for results
+        """)
+    
+    with col2:
+        st.markdown("""
+        ### 🎯 Features:
+        - **🎤 Speaker Identification**: Automatically identifies different speakers
+        - **⏰ Timecodes**: Shows when each segment was spoken
+        - **📊 Audio Analysis**: Duration and segment statistics
+        - **📥 Multiple Export Formats**: Text, SRT subtitles, JSON data
+        - **🌍 Multi-language Support**: Auto-detect or specify language
+        - **📦 Smart Compression**: Automatically handles large files
+        - **🛡️ Error Handling**: Intelligent retry and fallback mechanisms
+        """)
     
     with st.expander("ℹ️ Large File Support"):
         st.markdown("""
