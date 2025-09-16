@@ -15,8 +15,9 @@ LANGUAGE_MAP = {
 }
 
 # File size limits (in bytes)
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB - conservative limit for API
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB - increased limit for large files
 RECOMMENDED_SIZE = 25 * 1024 * 1024  # 25MB - recommended size
+COMPRESSION_THRESHOLD = 40 * 1024 * 1024  # 40MB - auto-compress above this size
 
 def get_file_size_str(size_bytes):
     """Convert bytes to human readable file size"""
@@ -113,7 +114,9 @@ def validate_file_size(file_data, filename):
     file_size = len(file_data)
     
     if file_size > MAX_FILE_SIZE:
-        return False, f"File '{filename}' is {get_file_size_str(file_size)}, which exceeds the {get_file_size_str(MAX_FILE_SIZE)} limit."
+        return False, f"File '{filename}' is {get_file_size_str(file_size)}, which exceeds the {get_file_size_str(MAX_FILE_SIZE)} limit. Try compressing the file first."
+    elif file_size > COMPRESSION_THRESHOLD:
+        return True, f"File '{filename}' is {get_file_size_str(file_size)}. Compression is strongly recommended for files this large."
     elif file_size > RECOMMENDED_SIZE:
         return True, f"File '{filename}' is {get_file_size_str(file_size)}. This is large and may take longer to process."
     else:
@@ -186,18 +189,48 @@ if uploaded_file is not None:
     
     file_valid, file_info_message = validate_file_size(audio_data, uploaded_file.name)
     
-    # Display file info
+    # Display file info and compression options
     if file_valid:
-        if len(audio_data) > RECOMMENDED_SIZE:
+        if len(audio_data) > COMPRESSION_THRESHOLD:
             st.warning(file_info_message)
             
-            # Add compression options for large files
-            with st.expander("📦 File Compression Options (Recommended)"):
-                st.info("💡 Your file is large. Compression can reduce upload time and avoid API limits.")
+            # Auto-enable compression for very large files
+            with st.expander("📦 File Compression (Strongly Recommended)", expanded=True):
+                st.error(f"⚠️ Your file ({get_file_size_str(len(audio_data))}) is very large. Compression is strongly recommended to avoid API limits.")
                 
                 compression_enabled = st.checkbox(
                     "Enable automatic compression",
-                    value=True,
+                    value=True,  # Auto-enabled for large files
+                    help="Compress audio to reduce file size while maintaining quality for transcription"
+                )
+                
+                if compression_enabled:
+                    # More aggressive compression for very large files
+                    max_target = min(40, len(audio_data) // (1024 * 1024) // 2)  # Half the original size or 40MB max
+                    target_size = st.slider(
+                        "Target file size (MB)",
+                        min_value=15,
+                        max_value=max_target,
+                        value=min(25, max_target),
+                        help="Aggressive compression needed for very large files"
+                    )
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Original Size", get_file_size_str(len(audio_data)))
+                    with col2:
+                        st.metric("Target Size", f"~{target_size} MB")
+                        
+        elif len(audio_data) > RECOMMENDED_SIZE:
+            st.warning(file_info_message)
+            
+            # Optional compression for moderately large files
+            with st.expander("📦 File Compression Options (Recommended)"):
+                st.info("💡 Your file is large. Compression can reduce upload time and improve performance.")
+                
+                compression_enabled = st.checkbox(
+                    "Enable automatic compression",
+                    value=len(audio_data) > COMPRESSION_THRESHOLD,  # Auto-enable for very large files
                     help="Compress audio to reduce file size while maintaining quality for transcription"
                 )
                 
@@ -205,7 +238,7 @@ if uploaded_file is not None:
                     target_size = st.slider(
                         "Target file size (MB)",
                         min_value=10,
-                        max_value=30,
+                        max_value=35,
                         value=20,
                         help="Smaller files upload faster but may have slightly reduced audio quality"
                     )
@@ -316,9 +349,10 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
             else:
                 final_audio_data = audio_data
             
-            # Validate final file size
-            if len(final_audio_data) > MAX_FILE_SIZE:
-                st.error(f"File is still too large ({get_file_size_str(len(final_audio_data))}). Please try with more aggressive compression or a smaller file.")
+            # Validate final file size before sending to API
+            if len(final_audio_data) > 50 * 1024 * 1024:  # API actual limit is around 50MB
+                st.error(f"Compressed file is still too large ({get_file_size_str(len(final_audio_data))}) for the API. Please try with more aggressive compression.")
+                st.info("💡 Try reducing the target size to 15-20MB for better compatibility.")
             else:
                 with st.spinner("🎤 Transcribing audio..."):
                     lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
@@ -748,8 +782,9 @@ else:
         
         **File Size Guidelines:**
         - 📗 **Under 25MB**: Optimal processing speed
-        - 📙 **25-50MB**: Good, may take slightly longer
-        - 📕 **Over 50MB**: Automatic compression recommended
+        - 📙 **25-40MB**: Good, compression optional
+        - 📙 **40-76MB**: Large files, compression recommended
+        - 📕 **Over 76MB**: Very large, aggressive compression required
         
         **Tips for Best Results:**
         - Enable compression for files over 25MB
@@ -760,7 +795,9 @@ else:
         if os.getenv("DEBUG") == "true":
             st.code(f"""
 Debug Info:
-- Max API file size: {get_file_size_str(MAX_FILE_SIZE)}
+- Max file size limit: {get_file_size_str(MAX_FILE_SIZE)}
+- API size limit: {get_file_size_str(50 * 1024 * 1024)}
+- Compression threshold: {get_file_size_str(COMPRESSION_THRESHOLD)}
 - Recommended size: {get_file_size_str(RECOMMENDED_SIZE)}
 - FFmpeg available: {"Yes" if subprocess.run(['ffmpeg', '-version'], capture_output=True).returncode == 0 else "No"}
             """.strip()) 
