@@ -28,9 +28,10 @@ LANGUAGE_MAP = {
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB - much higher limit for chunking
 RECOMMENDED_SIZE = 25 * 1024 * 1024  # 25MB - recommended size
 CHUNKING_THRESHOLD = 40 * 1024 * 1024  # 40MB - auto-chunk above this size
-API_CHUNK_SIZE = 10 * 1024 * 1024  # 10MB - safer size per API call
-FALLBACK_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB - fallback for 500 errors
-EMERGENCY_CHUNK_SIZE = 2 * 1024 * 1024  # 2MB - emergency fallback
+API_CHUNK_SIZE = 3 * 1024 * 1024  # 3MB - much safer size per API call
+FALLBACK_CHUNK_SIZE = 1.5 * 1024 * 1024  # 1.5MB - fallback for 500 errors
+EMERGENCY_CHUNK_SIZE = 800 * 1024  # 800KB - emergency fallback
+ULTRA_EMERGENCY_CHUNK_SIZE = 400 * 1024  # 400KB - ultra emergency fallback
 
 def get_file_size_str(size_bytes):
     """Convert bytes to human readable file size"""
@@ -171,46 +172,54 @@ def adaptive_chunk_audio_file(audio_data, initial_chunk_size=API_CHUNK_SIZE):
     """Create chunks with adaptive sizing based on failure patterns"""
     total_size = len(audio_data)
     
-    # Start with smaller chunks if file is very large
-    if total_size > 100 * 1024 * 1024:  # > 100MB
-        chunk_size = FALLBACK_CHUNK_SIZE  # 5MB
-    elif total_size > 200 * 1024 * 1024:  # > 200MB  
-        chunk_size = EMERGENCY_CHUNK_SIZE  # 2MB
+    # Start with much smaller chunks to avoid 500 errors
+    if total_size > 200 * 1024 * 1024:  # > 200MB
+        chunk_size = EMERGENCY_CHUNK_SIZE  # 800KB
+    elif total_size > 100 * 1024 * 1024:  # > 100MB
+        chunk_size = FALLBACK_CHUNK_SIZE  # 1.5MB
+    elif total_size > 50 * 1024 * 1024:  # > 50MB
+        chunk_size = API_CHUNK_SIZE  # 3MB
     else:
         chunk_size = initial_chunk_size
     
-    chunks = chunk_audio_file(audio_data, chunk_size)
+    chunks = chunk_audio_file(audio_data, int(chunk_size))
     
-    # If we have too many chunks (processing will be slow), try to find a balance
-    max_reasonable_chunks = 20
+    # Allow more chunks for better reliability
+    max_reasonable_chunks = 50  # Increased from 20
     if len(chunks) > max_reasonable_chunks:
         # Try to balance between size and number of chunks
         optimal_chunk_size = total_size // max_reasonable_chunks
-        if optimal_chunk_size < EMERGENCY_CHUNK_SIZE:
-            optimal_chunk_size = EMERGENCY_CHUNK_SIZE
+        if optimal_chunk_size < ULTRA_EMERGENCY_CHUNK_SIZE:
+            optimal_chunk_size = ULTRA_EMERGENCY_CHUNK_SIZE
         elif optimal_chunk_size > FALLBACK_CHUNK_SIZE:
             optimal_chunk_size = FALLBACK_CHUNK_SIZE
         
-        chunks = chunk_audio_file(audio_data, optimal_chunk_size)
+        chunks = chunk_audio_file(audio_data, int(optimal_chunk_size))
     
-    return chunks, chunk_size
+    return chunks, int(chunk_size)
 
 def rechunk_on_failure(audio_data, failed_chunks, original_chunk_size):
     """Re-chunk the audio with smaller size when chunks fail with 500 errors"""
     debug_mode = os.getenv("DEBUG") == "true"
     
-    # Determine new chunk size based on failure pattern
+    # Determine new chunk size based on failure pattern - more aggressive reduction
     if original_chunk_size > FALLBACK_CHUNK_SIZE:
-        new_chunk_size = FALLBACK_CHUNK_SIZE  # 5MB
+        new_chunk_size = int(FALLBACK_CHUNK_SIZE)  # 1.5MB
         retry_msg = f"🔄 Retrying with smaller chunks ({get_file_size_str(new_chunk_size)} each)"
     elif original_chunk_size > EMERGENCY_CHUNK_SIZE:
-        new_chunk_size = EMERGENCY_CHUNK_SIZE  # 2MB
+        new_chunk_size = int(EMERGENCY_CHUNK_SIZE)  # 800KB
         retry_msg = f"🔄 Retrying with emergency small chunks ({get_file_size_str(new_chunk_size)} each)"
+    elif original_chunk_size > ULTRA_EMERGENCY_CHUNK_SIZE:
+        new_chunk_size = int(ULTRA_EMERGENCY_CHUNK_SIZE)  # 400KB
+        retry_msg = f"🔄 Retrying with ultra-small chunks ({get_file_size_str(new_chunk_size)} each)"
     else:
-        # Already at minimum size, can't go smaller
-        if debug_mode:
-            st.write("   ❌ Already at minimum chunk size, cannot reduce further")
-        return None, None
+        # Try one more time with even smaller chunks
+        new_chunk_size = int(ULTRA_EMERGENCY_CHUNK_SIZE * 0.5)  # 200KB
+        if new_chunk_size < 100 * 1024:  # Don't go below 100KB
+            if debug_mode:
+                st.write("   ❌ Already at minimum chunk size, cannot reduce further")
+            return None, None
+        retry_msg = f"🔄 Final attempt with micro chunks ({get_file_size_str(new_chunk_size)} each)"
     
     if debug_mode:
         st.write(f"   📉 Reducing chunk size: {get_file_size_str(original_chunk_size)} → {get_file_size_str(new_chunk_size)}")
@@ -313,6 +322,47 @@ def validate_chunk_data(chunk_data, chunk_num=1):
         elif len(set(chunk_data[:100])) < 10:
             # Very low entropy in first 100 bytes
             issues.append("Low entropy data (possibly corrupted)")
+    
+    return issues
+
+def diagnose_500_error_causes(chunk_data, api_key, lang_code, response_text=""):
+    """Diagnose potential causes of 500 errors beyond file size"""
+    issues = []
+    
+    # Check API key format
+    if not api_key or len(api_key.strip()) < 10:
+        issues.append("Invalid or too short API key")
+    elif not api_key.startswith(('sk-', 'fish_')):  # Common API key prefixes
+        issues.append("API key format may be incorrect")
+    
+    # Check audio format issues
+    if len(chunk_data) < 100:
+        issues.append(f"Audio chunk too small ({len(chunk_data)} bytes)")
+    elif not (chunk_data.startswith(b'ID3') or 
+              chunk_data.startswith(b'RIFF') or 
+              chunk_data.startswith(b'\xff\xfb') or 
+              chunk_data.startswith(b'\xff\xfa')):
+        issues.append("Unrecognized audio format - may not be valid audio")
+    
+    # Check for common error patterns in response
+    if response_text:
+        response_lower = response_text.lower()
+        if "invalid audio" in response_lower:
+            issues.append("Server reports invalid audio format")
+        elif "corrupted" in response_lower:
+            issues.append("Server reports corrupted audio data")
+        elif "timeout" in response_lower:
+            issues.append("Server-side timeout processing audio")
+        elif "memory" in response_lower or "resource" in response_lower:
+            issues.append("Server resource/memory issues")
+        elif "quota" in response_lower or "limit" in response_lower:
+            issues.append("API quota or rate limit exceeded")
+        elif "authentication" in response_lower:
+            issues.append("API authentication issue")
+    
+    # Check language code
+    if lang_code and lang_code not in ['en', 'zh', 'zh-tw', 'zh-yue']:
+        issues.append(f"Potentially unsupported language code: {lang_code}")
     
     return issues
 
@@ -561,7 +611,7 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
             "Content-Type": "application/msgpack"
         }
         
-        # Create the request payload
+        # Create and validate the request payload
         payload = {
             "audio": chunk_data,
             "ignore_timestamps": False,  # Enable timestamps
@@ -569,17 +619,41 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
         if lang_code:
             payload["language"] = lang_code
         
+        # Validate payload before sending
         if debug_mode:
             st.write(f"   Payload keys: {list(payload.keys())}")
             st.write(f"   Language: {lang_code or 'auto-detect'}")
+            st.write(f"   Audio data type: {type(chunk_data)}")
+            st.write(f"   Audio data size: {len(chunk_data)} bytes")
+            
+            # Check for potential audio data issues
+            if len(chunk_data) == 0:
+                st.error(f"   ❌ Empty audio data in chunk {chunk_num}")
+                return None
+            
+            # Check audio format
+            if chunk_data.startswith(b'ID3'):
+                st.write(f"   🎵 Audio format: MP3 with ID3 tag")
+            elif chunk_data.startswith(b'RIFF'):
+                st.write(f"   🎵 Audio format: WAV/RIFF")
+            elif chunk_data.startswith(b'\xff\xfb') or chunk_data.startswith(b'\xff\xfa'):
+                st.write(f"   🎵 Audio format: MP3 frame")
+            else:
+                st.write(f"   ⚠️ Audio format: Unknown - first bytes: {chunk_data[:10].hex()}")
+                # This might be causing 500 errors - invalid audio format
+                st.warning(f"   ⚠️ Unusual audio format detected - this may cause API errors")
         
-        # Shorter timeout for individual chunks, but longer for larger chunks
-        base_timeout = 60
-        size_timeout = int(chunk_size_mb * 5)  # 5 seconds per MB
-        timeout_seconds = min(base_timeout + size_timeout, 180)  # Max 3 minutes
+        # Adaptive timeout based on chunk size
+        if chunk_size_mb < 1:  # Less than 1MB
+            timeout_seconds = 45  # Shorter timeout for small chunks
+        elif chunk_size_mb < 5:  # Less than 5MB
+            timeout_seconds = 90  # Medium timeout
+        else:
+            timeout_seconds = 150  # Longer timeout for larger chunks
         
+        # Add extra time for retry attempts
         if debug_mode:
-            st.write(f"   Timeout: {timeout_seconds}s")
+            st.write(f"   ⏱️ Timeout set to {timeout_seconds}s for {chunk_size_mb:.1f}MB chunk")
         
         # Retry logic for individual chunks
         max_retries = 2
@@ -625,18 +699,43 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
                     if hasattr(response, 'headers') and 'content-type' in response.headers:
                         st.write(f"   📄 Content-Type: {response.headers['content-type']}")
                 
-                # Check for server errors
+                # Check for server errors with detailed logging
                 if response.status_code in [500, 502, 503, 504]:
                     last_error = f"Server error {response.status_code}: {response.text[:200]}"
-                    if debug_mode:
-                        st.write(f"   ⚠️ Server error details: {last_error}")
+                    
+                    # Enhanced error logging
+                    if debug_mode or total_chunks > 1:
+                        st.write(f"   ⚠️ Server error details:")
+                        st.write(f"      Status: {response.status_code}")
+                        st.write(f"      Chunk: {chunk_num}/{total_chunks}")
+                        st.write(f"      Size: {chunk_size_mb:.1f}MB")
+                        st.write(f"      Attempt: {attempt + 1}/{max_retries + 1}")
+                        if hasattr(response, 'headers'):
+                            content_type = response.headers.get('content-type', 'unknown')
+                            st.write(f"      Response type: {content_type}")
+                        if len(response.text) > 0:
+                            st.write(f"      Error message: {response.text[:300]}")
+                        else:
+                            st.write(f"      No error message in response")
+                    
                     if attempt < max_retries:
                         continue
                     else:
+                        # Run comprehensive diagnosis on persistent 500 errors
+                        diagnosis = diagnose_500_error_causes(chunk_data, api_key, lang_code, response.text)
+                        
                         if total_chunks > 1:
                             st.error(f"❌ Chunk {chunk_num} failed after {max_retries + 1} attempts: {last_error}")
+                            if diagnosis:
+                                st.error("🔍 Potential causes of 500 error:")
+                                for issue in diagnosis:
+                                    st.write(f"   • {issue}")
                         else:
                             show_api_error(response.status_code, response.text)
+                            if diagnosis:
+                                st.error("🔍 Potential causes:")
+                                for issue in diagnosis:
+                                    st.write(f"   • {issue}")
                         return None
                 
                 if response.status_code == 200:
@@ -699,6 +798,35 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
             st.error(f"❌ Error during transcription: {str(e)}")
         return None
 
+def test_api_connection(api_key):
+    """Test API connection with a minimal request to diagnose issues"""
+    try:
+        # Create a minimal test payload
+        test_audio = b'\xff\xfb' + b'\x00' * 1000  # Minimal MP3-like data
+        
+        url = "https://api.fish.audio/v1/asr"
+        headers = {
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/msgpack"
+        }
+        
+        payload = {
+            "audio": test_audio,
+            "ignore_timestamps": True,
+        }
+        
+        response = requests.post(
+            url, 
+            headers=headers, 
+            data=ormsgpack.packb(payload), 
+            timeout=30
+        )
+        
+        return response.status_code, response.text
+        
+    except Exception as e:
+        return None, str(e)
+
 def show_api_error(status_code, response_text):
     """Show appropriate error message based on API response"""
     if status_code == 413:
@@ -708,24 +836,41 @@ def show_api_error(status_code, response_text):
         st.error("⏰ Rate limit exceeded. Please wait and try again.")
     elif status_code == 401:
         st.error("🔑 Invalid API key. Please check your Fish Audio API key.")
+        st.info("💡 Test your API key with a simple request to verify it's working.")
     elif status_code == 400:
         st.error("❌ Bad request. Check if your audio file format is supported.")
+        st.info("💡 The API may not recognize the audio format. Try converting to MP3.")
     elif status_code == 500:
         st.error("🔥 Server error (500) - The Fish Audio API server encountered an issue.")
-        st.error("💡 This typically means the file is still too large or complex for processing.")
-        with st.expander("🔧 Troubleshooting Steps"):
+        
+        # Enhanced 500 error troubleshooting
+        with st.expander("🔧 500 Error Troubleshooting Guide"):
             st.markdown("""
-            **Try these solutions:**
-            1. **File too large**: Even after chunking, individual chunks might be too big
-            2. **Audio format issue**: Try converting to MP3 format first
-            3. **File duration**: Very long files (>2 hours) may cause issues
-            4. **Server capacity**: The API might be overloaded right now
+            **Common Causes of 500 Errors:**
             
-            **Quick fixes:**
-            - Split your audio into smaller segments (30-60 minutes each)
-            - Convert to MP3 with lower bitrate using external tools
-            - Try again in 10-15 minutes when server load is lower
-            - Use a different audio file to test if the issue persists
+            1. **Audio Format Issues**:
+               - Corrupted audio file
+               - Unsupported audio codec
+               - Invalid audio headers
+               
+            2. **API Key Problems**:
+               - Expired API key
+               - Insufficient permissions
+               - Account quota exceeded
+               
+            3. **Server-Side Issues**:
+               - API server overload
+               - Processing timeout
+               - Memory/resource limits
+            
+            **Solutions to Try:**
+            
+            ✅ **Test API Key**: Use debug mode to test your API key
+            ✅ **Convert Audio**: Try converting to standard MP3 format
+            ✅ **Reduce Quality**: Lower bitrate/sample rate
+            ✅ **Split File**: Break into smaller time segments (not just smaller chunks)
+            ✅ **Try Different File**: Test with a known-good audio file
+            ✅ **Wait and Retry**: Server may be temporarily overloaded
             """)
     elif status_code == 502 or status_code == 503:
         st.error(f"🔧 Service temporarily unavailable ({status_code})")
@@ -870,6 +1015,27 @@ with st.expander("🔧 Advanced Options"):
     if debug_mode:
         os.environ["DEBUG"] = "true"
         st.info("🔍 Debug mode enabled - detailed processing info will be shown")
+        
+        # API testing in debug mode
+        if st.button("🧪 Test API Connection", help="Test your API key with a minimal request"):
+            if api_key:
+                with st.spinner("Testing API connection..."):
+                    status_code, response_text = test_api_connection(api_key)
+                    
+                    if status_code is None:
+                        st.error(f"❌ Connection failed: {response_text}")
+                    elif status_code == 200:
+                        st.success("✅ API connection successful!")
+                    elif status_code == 401:
+                        st.error("❌ API key authentication failed")
+                    elif status_code == 500:
+                        st.error("❌ API server error - this may be the cause of your 500 errors")
+                        st.write(f"Response: {response_text[:200]}")
+                    else:
+                        st.warning(f"⚠️ API responded with status {status_code}")
+                        st.write(f"Response: {response_text[:200]}")
+            else:
+                st.error("❌ Please enter your API key first")
     else:
         os.environ.pop("DEBUG", None)
     
@@ -967,9 +1133,9 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                 successful_count = len(successful_chunks)
                 failed_count = total_chunks - successful_count
                 
-                # If most chunks failed and we haven't tried smaller chunks yet, retry
+                # If many chunks failed and we haven't tried smaller chunks yet, retry
                 failure_rate = failed_count / total_chunks
-                if failure_rate >= 0.5 and chunk_size > EMERGENCY_CHUNK_SIZE:  # 50% or more failed
+                if (failure_rate >= 0.3 or failed_count >= 2) and chunk_size > ULTRA_EMERGENCY_CHUNK_SIZE:  # 30% or more failed, or 2+ failures
                     st.warning(f"⚠️ {failed_count}/{total_chunks} chunks failed. Attempting automatic recovery with smaller chunks...")
                     
                     # Try re-chunking with smaller size
@@ -1476,8 +1642,9 @@ Debug Info:
 - Max file size limit: {get_file_size_str(MAX_FILE_SIZE)}
 - Chunking threshold: {get_file_size_str(CHUNKING_THRESHOLD)}
 - Default chunk size: {get_file_size_str(API_CHUNK_SIZE)}
-- Fallback chunk size: {get_file_size_str(FALLBACK_CHUNK_SIZE)}
+- Fallback chunk size: {get_file_size_str(int(FALLBACK_CHUNK_SIZE))}
 - Emergency chunk size: {get_file_size_str(EMERGENCY_CHUNK_SIZE)}
+- Ultra emergency chunk size: {get_file_size_str(ULTRA_EMERGENCY_CHUNK_SIZE)}
 - Recommended size: {get_file_size_str(RECOMMENDED_SIZE)}
-- Adaptive chunking: Yes (auto-adjusts based on file size and failures)
+- Adaptive chunking: Yes (ultra-aggressive sizing to prevent 500 errors)
             """.strip()) 
