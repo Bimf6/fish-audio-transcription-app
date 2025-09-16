@@ -28,4 +28,16 @@ echo ""
 # Use the Python version that has working Streamlit (3.9 user install)
 echo "Using Python 3 with user packages..."
 export PATH="/Users/ellelammba/Library/Python/3.9/bin:$PATH"
-python3 -m streamlit run app.py 
+
+# Try different approaches to run Streamlit
+if python3 -c "import streamlit" 2>/dev/null; then
+    echo "✅ Streamlit found with Python 3"
+    python3 -m streamlit run app.py
+elif /Users/ellelammba/Library/Python/3.9/bin/streamlit --version 2>/dev/null; then
+    echo "✅ Using direct Streamlit binary"
+    /Users/ellelammba/Library/Python/3.9/bin/streamlit run app.py
+else
+    echo "❌ Streamlit not working. Trying to reinstall..."
+    python3 -m pip install --user --force-reinstall streamlit==1.39.0
+    python3 -m streamlit run app.py
+fi 
