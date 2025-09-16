@@ -6,6 +6,8 @@ import base64
 import ormsgpack
 import tempfile
 import subprocess
+import math
+import io
 from pathlib import Path
 
 LANGUAGE_MAP = {
@@ -15,9 +17,10 @@ LANGUAGE_MAP = {
 }
 
 # File size limits (in bytes)
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB - increased limit for large files
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB - much higher limit for chunking
 RECOMMENDED_SIZE = 25 * 1024 * 1024  # 25MB - recommended size
-COMPRESSION_THRESHOLD = 40 * 1024 * 1024  # 40MB - auto-compress above this size
+CHUNKING_THRESHOLD = 40 * 1024 * 1024  # 40MB - auto-chunk above this size
+API_CHUNK_SIZE = 20 * 1024 * 1024  # 20MB - safe size per API call
 
 def get_file_size_str(size_bytes):
     """Convert bytes to human readable file size"""
@@ -134,14 +137,213 @@ def compress_audio_fallback(input_data, target_size_mb=20):
     result = input_data[:target_bytes]
     return result
 
+def chunk_audio_file(audio_data, chunk_size_bytes=API_CHUNK_SIZE):
+    """Split large audio file into smaller chunks that can be processed by the API"""
+    chunks = []
+    total_size = len(audio_data)
+    
+    if total_size <= chunk_size_bytes:
+        return [audio_data]  # No need to chunk
+    
+    # For MP3 files, try to find frame boundaries for better splitting
+    if audio_data.startswith(b'ID3') or (len(audio_data) > 2 and audio_data[0:2] == b'\xff\xfb'):
+        # MP3 file - try to split more intelligently
+        chunks = chunk_mp3_audio(audio_data, chunk_size_bytes)
+    else:
+        # For other formats, use simple byte-based chunking
+        for i in range(0, total_size, chunk_size_bytes):
+            chunk = audio_data[i:i + chunk_size_bytes]
+            chunks.append(chunk)
+    
+    return chunks
+
+def chunk_mp3_audio(audio_data, chunk_size_bytes):
+    """Smart chunking for MP3 files to preserve structure"""
+    chunks = []
+    total_size = len(audio_data)
+    
+    # Find the end of ID3 tag if present
+    header_end = 0
+    if audio_data.startswith(b'ID3'):
+        # ID3v2 tag - skip it for better chunking
+        if len(audio_data) > 10:
+            # Get tag size from header
+            tag_size = (audio_data[6] << 21) | (audio_data[7] << 14) | (audio_data[8] << 7) | audio_data[9]
+            header_end = tag_size + 10
+    
+    # Keep the header with the first chunk
+    remaining_data = audio_data[header_end:]
+    current_pos = 0
+    
+    while current_pos < len(remaining_data):
+        chunk_end = min(current_pos + chunk_size_bytes, len(remaining_data))
+        
+        if current_pos == 0:
+            # First chunk - include the header
+            chunk = audio_data[:header_end] + remaining_data[current_pos:chunk_end]
+        else:
+            # Subsequent chunks - just the data
+            chunk = remaining_data[current_pos:chunk_end]
+        
+        chunks.append(chunk)
+        current_pos = chunk_end
+    
+    return chunks
+
+def estimate_chunk_duration(chunk_size_bytes, total_duration_ms, total_file_size):
+    """Estimate the duration of an audio chunk in milliseconds"""
+    if total_file_size == 0:
+        return 0
+    
+    chunk_ratio = chunk_size_bytes / total_file_size
+    return int(total_duration_ms * chunk_ratio)
+
+def stitch_transcripts(transcript_chunks, chunk_durations):
+    """Combine multiple transcript chunks into a single result with proper timestamps"""
+    combined_text = ""
+    combined_segments = []
+    current_time_offset = 0.0
+    
+    for i, (transcript_data, chunk_duration_ms) in enumerate(zip(transcript_chunks, chunk_durations)):
+        if not transcript_data:
+            continue
+            
+        # Add text
+        if combined_text:
+            combined_text += " "
+        combined_text += transcript_data.get('text', '')
+        
+        # Add segments with adjusted timestamps
+        segments = transcript_data.get('segments', [])
+        for segment in segments:
+            adjusted_segment = segment.copy()
+            adjusted_segment['start'] = segment.get('start', 0) + current_time_offset
+            adjusted_segment['end'] = segment.get('end', 0) + current_time_offset
+            combined_segments.append(adjusted_segment)
+        
+        # Update time offset for next chunk (convert ms to seconds)
+        current_time_offset += chunk_duration_ms / 1000.0
+    
+    # Calculate total duration
+    total_duration = sum(chunk_durations)
+    
+    return {
+        'text': combined_text,
+        'segments': combined_segments,
+        'duration': total_duration
+    }
+
+def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunks=1):
+    """Process a single audio chunk and return the transcript result"""
+    try:
+        # Direct API call to Fish Audio
+        url = "https://api.fish.audio/v1/asr"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/msgpack"
+        }
+        
+        # Create the request payload
+        payload = {
+            "audio": chunk_data,
+            "ignore_timestamps": False,  # Enable timestamps
+        }
+        if lang_code:
+            payload["language"] = lang_code
+        
+        # Shorter timeout for individual chunks
+        timeout_seconds = 120  # 2 minutes per chunk should be enough
+        
+        # Retry logic for individual chunks
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt > 0:
+                    import time
+                    wait_time = 3 + attempt  # 3s, 4s
+                    time.sleep(wait_time)
+                
+                response = requests.post(
+                    url, 
+                    headers=headers, 
+                    data=ormsgpack.packb(payload), 
+                    timeout=timeout_seconds
+                )
+                
+                # Check for server errors
+                if response.status_code in [500, 502, 503, 504] and attempt < max_retries:
+                    continue
+                
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    if chunk_num == 1 and total_chunks == 1:
+                        # Show detailed error for single file processing
+                        show_api_error(response.status_code, response.text)
+                    return None
+                    
+            except requests.exceptions.Timeout:
+                if attempt < max_retries:
+                    continue
+                else:
+                    if chunk_num == 1 and total_chunks == 1:
+                        st.error("⏰ Request timed out. Please try with a smaller audio file.")
+                    return None
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries:
+                    continue
+                else:
+                    if chunk_num == 1 and total_chunks == 1:
+                        st.error(f"🔄 Network error: {str(e)}")
+                    return None
+                    
+    except Exception as e:
+        if chunk_num == 1 and total_chunks == 1:
+            st.error(f"❌ Error during transcription: {str(e)}")
+        return None
+
+def show_api_error(status_code, response_text):
+    """Show appropriate error message based on API response"""
+    if status_code == 413:
+        st.error("🚫 File too large for API (413 error)")
+        st.info("💡 Try with a smaller audio file or check if chunking is working properly.")
+    elif status_code == 429:
+        st.error("⏰ Rate limit exceeded. Please wait and try again.")
+    elif status_code == 401:
+        st.error("🔑 Invalid API key. Please check your Fish Audio API key.")
+    elif status_code == 400:
+        st.error("❌ Bad request. Check if your audio file format is supported.")
+    elif status_code == 500:
+        st.error("🔥 Server error (500) - The Fish Audio API server encountered an issue.")
+        st.error("💡 This typically means the file is still too large or complex for processing.")
+        with st.expander("🔧 Troubleshooting Steps"):
+            st.markdown("""
+            **Try these solutions:**
+            1. **File too large**: Even after chunking, individual chunks might be too big
+            2. **Audio format issue**: Try converting to MP3 format first
+            3. **File duration**: Very long files (>2 hours) may cause issues
+            4. **Server capacity**: The API might be overloaded right now
+            
+            **Quick fixes:**
+            - Split your audio into smaller segments (30-60 minutes each)
+            - Convert to MP3 with lower bitrate using external tools
+            - Try again in 10-15 minutes when server load is lower
+            - Use a different audio file to test if the issue persists
+            """)
+    elif status_code == 502 or status_code == 503:
+        st.error(f"🔧 Service temporarily unavailable ({status_code})")
+        st.info("💡 The Fish Audio service may be busy. Try again in a few minutes.")
+    else:
+        st.error(f"API Error {status_code}: {response_text}")
+
 def validate_file_size(file_data, filename):
     """Validate file size and provide user feedback"""
     file_size = len(file_data)
     
     if file_size > MAX_FILE_SIZE:
-        return False, f"File '{filename}' is {get_file_size_str(file_size)}, which exceeds the {get_file_size_str(MAX_FILE_SIZE)} limit. Try compressing the file first."
-    elif file_size > COMPRESSION_THRESHOLD:
-        return True, f"File '{filename}' is {get_file_size_str(file_size)}. Compression is strongly recommended for files this large."
+        return False, f"File '{filename}' is {get_file_size_str(file_size)}, which exceeds the {get_file_size_str(MAX_FILE_SIZE)} limit."
+    elif file_size > CHUNKING_THRESHOLD:
+        return True, f"File '{filename}' is {get_file_size_str(file_size)}. Will be processed in chunks for optimal results."
     elif file_size > RECOMMENDED_SIZE:
         return True, f"File '{filename}' is {get_file_size_str(file_size)}. This is large and may take longer to process."
     else:
@@ -214,36 +416,20 @@ if uploaded_file is not None:
     
     file_valid, file_info_message = validate_file_size(audio_data, uploaded_file.name)
     
-    # Auto-handle file compression transparently
-    compression_enabled = False
-    target_size = 20  # Default target size
+    # Auto-handle file chunking transparently
+    use_chunking = False
     
     if file_valid:
-        if len(audio_data) > COMPRESSION_THRESHOLD:
-            st.warning(f"📦 Large file detected ({get_file_size_str(len(audio_data))}). Will automatically compress for optimal processing.")
-            compression_enabled = True
-            # Automatically determine optimal target size
-            file_size_mb = len(audio_data) / (1024 * 1024)
-            if file_size_mb > 80:
-                target_size = 15  # Very aggressive for huge files
-            elif file_size_mb > 60:
-                target_size = 18  # Aggressive for large files
-            else:
-                target_size = 22  # Moderate for medium-large files
+        if len(audio_data) > CHUNKING_THRESHOLD:
+            use_chunking = True
+            num_chunks = math.ceil(len(audio_data) / API_CHUNK_SIZE)
+            st.info(f"🧩 Large file detected ({get_file_size_str(len(audio_data))}). Will process in {num_chunks} chunks for best quality.")
         elif len(audio_data) > RECOMMENDED_SIZE:
-            st.info(f"📂 Medium file ({get_file_size_str(len(audio_data))}) - will compress if needed.")
-            compression_enabled = True
-            target_size = 25  # Less aggressive for medium files
+            st.info(f"📂 Medium file ({get_file_size_str(len(audio_data))}) - processing normally.")
         else:
             st.success(file_info_message)
     else:
         st.error(file_info_message)
-        st.info("💡 Try compressing your audio file using an external tool, or enable compression below.")
-        
-        # Auto-enable emergency compression for oversized files
-        compression_enabled = True
-        target_size = 12  # Very aggressive compression for oversized files
-        st.info("🔧 File exceeds limits. Will attempt emergency compression.")
 
 language = st.selectbox(
     "Select language", 
@@ -293,169 +479,81 @@ if 'transcript' not in st.session_state:
 if st.button("Transcribe", type="primary", disabled=not uploaded_file or not file_valid or not api_key):
     if uploaded_file is not None and api_key and file_valid:
         try:
-            # Prepare audio data with optional compression
-            if compression_enabled:
-                with st.spinner("🔄 Optimizing audio file for transcription..."):
-                    progress_bar = st.progress(0)
-                    
-                    progress_bar.progress(25)
-                    compressed_data = compress_audio_ffmpeg(audio_data, target_size)
-                    progress_bar.progress(75)
-                    
-                    if compressed_data:
-                        final_audio_data = compressed_data
-                        compression_ratio = len(audio_data) / len(compressed_data)
-                        progress_bar.progress(100)
-                        st.success(f"✅ File optimized: {get_file_size_str(len(audio_data))} → {get_file_size_str(len(compressed_data))}")
-                    else:
-                        st.warning("⚠️ Optimization failed. Using original file...")
-                        final_audio_data = audio_data
-                    
-                    progress_bar.empty()
-            else:
-                final_audio_data = audio_data
+            lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
             
-            # Validate final file size before sending to API
-            if len(final_audio_data) > 50 * 1024 * 1024:  # API actual limit is around 50MB
-                st.error(f"Compressed file is still too large ({get_file_size_str(len(final_audio_data))}) for the API. Please try with more aggressive compression.")
-                st.info("💡 Try reducing the target size to 15-20MB for better compatibility.")
-            else:
-                with st.spinner("🎤 Transcribing audio..."):
-                    lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
+            if use_chunking:
+                # Process large file in chunks
+                with st.spinner("🧩 Splitting audio file into chunks..."):
+                    chunks = chunk_audio_file(audio_data, API_CHUNK_SIZE)
+                    st.info(f"📦 Split into {len(chunks)} chunks of ~{get_file_size_str(API_CHUNK_SIZE)} each")
                 
-                    # Direct API call to Fish Audio (using same format as SDK)
-                    url = "https://api.fish.audio/v1/asr"
-                    headers = {
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/msgpack"
-                    }
-                    
-                    # Create the request payload (same as ASRRequest)
-                    payload = {
-                        "audio": final_audio_data,
-                        "ignore_timestamps": False,  # Enable timestamps
-                    }
-                    if lang_code:
-                        payload["language"] = lang_code
-                    
-                    # Show upload progress
-                    upload_progress = st.progress(0)
-                    st.info(f"Uploading {get_file_size_str(len(final_audio_data))} to Fish Audio API...")
-                    upload_progress.progress(30)
-                    
-                    # Use ormsgpack like the original SDK with longer timeout for large files
-                    timeout_seconds = min(180, max(90, len(final_audio_data) // (1024 * 1024) * 3))  # 3 seconds per MB, min 90s, max 180s
-                    
-                    # Robust retry logic for large files and server errors
-                    max_retries = 3
-                    response = None
-                    
-                    for attempt in range(max_retries + 1):
-                        try:
-                            if attempt > 0:
-                                wait_time = min(5 + (attempt * 2), 15)  # Progressive wait: 5s, 7s, 9s, max 15s
-                                st.warning(f"🔄 Attempt {attempt + 1}/{max_retries + 1} - Waiting {wait_time}s before retry...")
-                                import time
-                                time.sleep(wait_time)
-                                upload_progress.progress(30 + (attempt * 15))
-                            
-                            response = requests.post(
-                                url, 
-                                headers=headers, 
-                                data=ormsgpack.packb(payload), 
-                                timeout=timeout_seconds
-                            )
-                            
-                            # Check if we got a server error that we should retry
-                            if response.status_code in [500, 502, 503, 504] and attempt < max_retries:
-                                st.warning(f"⚠️ Server error {response.status_code}, retrying...")
-                                timeout_seconds += 20  # Increase timeout for next attempt
-                                continue
-                            
-                            upload_progress.progress(100)
-                            upload_progress.empty()
-                            break  # Success or non-retryable error, exit retry loop
-                            
-                        except requests.exceptions.Timeout:
-                            if attempt < max_retries:
-                                st.warning(f"⏰ Upload timed out, increasing timeout and retrying...")
-                                timeout_seconds += 30  # Increase timeout for retry
-                                continue
-                            else:
-                                raise  # Re-raise if all retries failed
-                        except requests.exceptions.RequestException as e:
-                            if attempt < max_retries:
-                                st.warning(f"🔄 Network error, retrying... ({str(e)[:50]})")
-                                continue
-                            else:
-                                raise
+                # Process each chunk
+                transcript_chunks = []
+                chunk_durations = []
+                total_chunks = len(chunks)
                 
-                if response.status_code == 200:
-                    result = response.json()
+                progress_container = st.container()
+                with progress_container:
+                    overall_progress = st.progress(0)
+                    status_text = st.empty()
                     
-                    # Debug: Show API response structure
-                    if os.getenv("DEBUG") == "true":
-                        st.write("**API Response Debug:**")
-                        st.write(f"Response keys: {list(result.keys())}")
-                        st.write(f"Full response: {result}")
+                    for i, chunk in enumerate(chunks):
+                        chunk_num = i + 1
+                        status_text.text(f"🎤 Processing chunk {chunk_num}/{total_chunks}...")
+                        
+                        # Process individual chunk
+                        chunk_result = process_audio_chunk(chunk, lang_code, api_key, chunk_num, total_chunks)
+                        
+                        if chunk_result:
+                            transcript_chunks.append(chunk_result)
+                            # Estimate duration based on chunk size
+                            estimated_duration = estimate_chunk_duration(len(chunk), len(audio_data) * 30000, len(audio_data))  # Assume 30s per MB
+                            chunk_durations.append(estimated_duration)
+                        else:
+                            st.error(f"❌ Failed to process chunk {chunk_num}")
+                            break
+                        
+                        # Update progress
+                        progress = (chunk_num) / total_chunks
+                        overall_progress.progress(progress)
                     
-                    st.session_state['transcript'] = result.get('text', 'No transcript available')
+                    overall_progress.empty()
+                    status_text.empty()
+                
+                if len(transcript_chunks) == total_chunks:
+                    # Stitch results together
+                    with st.spinner("🔗 Combining transcripts..."):
+                        result = stitch_transcripts(transcript_chunks, chunk_durations)
+                    
+                    st.session_state['transcript'] = result.get('text', '')
                     st.session_state['transcript_data'] = result
                     st.session_state['segments'] = result.get('segments', [])
                     st.session_state['duration'] = result.get('duration', 0)
                     
-                    # Debug: Show what we stored
-                    if os.getenv("DEBUG") == "true":
-                        st.write(f"**Stored segments count**: {len(st.session_state['segments'])}")
-                        st.write(f"**Stored transcript length**: {len(st.session_state['transcript'])}")
-                    
-                    st.success("Transcription completed!")
+                    st.success(f"✅ Transcription completed! Processed {total_chunks} chunks successfully.")
                 else:
-                    if response.status_code == 413:
-                        st.error("🚫 File too large for API (413 error)")
-                        st.info("💡 Try enabling compression above or use a smaller audio file.")
-                    elif response.status_code == 429:
-                        st.error("⏰ Rate limit exceeded. Please wait and try again.")
-                    elif response.status_code == 401:
-                        st.error("🔑 Invalid API key. Please check your Fish Audio API key.")
-                    elif response.status_code == 400:
-                        st.error("❌ Bad request. Check if your audio file format is supported.")
-                    elif response.status_code == 500:
-                        st.error("🔥 Server error (500) - The Fish Audio API server encountered an issue.")
-                        st.error("💡 This typically means the file is still too large or complex for processing.")
-                        with st.expander("🔧 Troubleshooting Steps"):
-                            st.markdown("""
-                            **Try these solutions:**
-                            1. **File too large**: Even after compression, your file might be too big
-                            2. **Audio format issue**: Try converting to MP3 format first
-                            3. **File duration**: Very long files (>2 hours) may cause issues
-                            4. **Server capacity**: The API might be overloaded right now
-                            
-                            **Quick fixes:**
-                            - Split your audio into smaller segments (30-60 minutes each)
-                            - Convert to MP3 with lower bitrate using external tools
-                            - Try again in 10-15 minutes when server load is lower
-                            - Use a different audio file to test if the issue persists
-                            """)
-                    elif response.status_code == 502 or response.status_code == 503:
-                        st.error(f"🔧 Service temporarily unavailable ({response.status_code})")
-                        st.info("💡 The Fish Audio service may be busy. Try again in a few minutes.")
+                    st.error("❌ Some chunks failed to process. Please try again.")
+                    
+            else:
+                # Process normally for smaller files
+                with st.spinner("🎤 Transcribing audio..."):
+                    result = process_audio_chunk(audio_data, lang_code, api_key)
+                    
+                    if result:
+                        st.session_state['transcript'] = result.get('text', '')
+                        st.session_state['transcript_data'] = result
+                        st.session_state['segments'] = result.get('segments', [])
+                        st.session_state['duration'] = result.get('duration', 0)
+                        
+                        st.success("✅ Transcription completed!")
                     else:
-                        st.error(f"API Error {response.status_code}: {response.text}")
-                    
-                    st.session_state['transcript'] = ""
-                    st.session_state['transcript_data'] = None
-                    st.session_state['segments'] = []
-                    
-        except requests.exceptions.Timeout:
-            st.error("Request timed out. Please try with a smaller audio file.")
-            st.session_state['transcript'] = ""
-        except requests.exceptions.RequestException as e:
-            st.error(f"Network error: {str(e)}")
-            st.session_state['transcript'] = ""
+                        st.error("❌ Transcription failed. Please try again.")
+                        
         except Exception as e:
             st.error(f"Error during transcription: {str(e)}")
             st.session_state['transcript'] = ""
+            st.session_state['transcript_data'] = None
+            st.session_state['segments'] = []
     elif not api_key:
         st.error("🔑 Please enter your Fish Audio API key in the sidebar to continue.")
         st.info("💡 Don't have an API key? Get one free at [Fish Audio](https://fish.audio)")
@@ -794,30 +892,31 @@ else:
     with st.expander("ℹ️ Large File Support"):
         st.markdown("""
         **New! Large File Handling:**
-        - ✅ Files up to 76MB+ are now supported
-        - 🔄 Automatic compression when files exceed API limits
-        - 📈 Real-time progress feedback during upload and compression
-        - ⚡ Smart bitrate calculation preserves audio quality
-        - 🎯 Fallback compression when FFmpeg is unavailable
+        - ✅ Files up to 500MB+ are now supported
+        - 🧩 Automatic chunking when files exceed API limits  
+        - 📈 Real-time progress feedback during batch processing
+        - 🔗 Smart transcript stitching preserves timestamps
+        - ⭐ No quality loss - processes full audio content
         
         **File Size Guidelines:**
-        - 📗 **Under 25MB**: Optimal processing speed
-        - 📙 **25-40MB**: Good, compression optional
-        - 📙 **40-76MB**: Large files, compression recommended
-        - 📕 **Over 76MB**: Very large, aggressive compression required
+        - 📗 **Under 25MB**: Single file processing
+        - 📙 **25-40MB**: Single file, may take longer
+        - 📙 **40-100MB**: Automatic chunking (3-5 chunks)
+        - 📕 **Over 100MB**: Batch processing (5+ chunks)
         
         **Tips for Best Results:**
-        - Enable compression for files over 25MB
-        - Lower target sizes upload faster but may reduce quality slightly
-        - MP3 format generally works best for large files
+        - MP3 format works best for large files and chunking
+        - Very long files (3+ hours) are automatically split into optimal chunks
+        - Each chunk is processed independently for better reliability
+        - Timestamps are automatically adjusted across chunks
         """)
         
         if os.getenv("DEBUG") == "true":
             st.code(f"""
 Debug Info:
 - Max file size limit: {get_file_size_str(MAX_FILE_SIZE)}
-- API size limit: {get_file_size_str(50 * 1024 * 1024)}
-- Compression threshold: {get_file_size_str(COMPRESSION_THRESHOLD)}
+- Chunking threshold: {get_file_size_str(CHUNKING_THRESHOLD)}
+- API chunk size: {get_file_size_str(API_CHUNK_SIZE)}
 - Recommended size: {get_file_size_str(RECOMMENDED_SIZE)}
-- FFmpeg available: {"Yes" if subprocess.run(['ffmpeg', '-version'], capture_output=True).returncode == 0 else "No"}
+- Chunking enabled: Yes (automatic for large files)
             """.strip()) 
