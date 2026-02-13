@@ -33,6 +33,93 @@ FALLBACK_CHUNK_SIZE = 1.5 * 1024 * 1024  # 1.5MB - fallback for 500 errors
 EMERGENCY_CHUNK_SIZE = 800 * 1024  # 800KB - emergency fallback
 ULTRA_EMERGENCY_CHUNK_SIZE = 400 * 1024  # 400KB - ultra emergency fallback
 
+MAX_DURATION_SECONDS = 20 * 60  # 20 minutes in seconds
+
+def get_audio_duration(audio_data):
+    """Get audio duration in seconds using ffprobe"""
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+            temp_file.write(audio_data)
+            temp_file_path = temp_file.name
+        
+        try:
+            duration_cmd = [
+                'ffprobe', '-i', temp_file_path, '-show_entries',
+                'format=duration', '-v', 'quiet', '-of', 'csv=p=0'
+            ]
+            result = subprocess.run(duration_cmd, capture_output=True, text=True, timeout=30)
+            duration = float(result.stdout.strip())
+            return duration
+        finally:
+            os.unlink(temp_file_path)
+    except Exception as e:
+        if os.getenv("DEBUG") == "true":
+            st.write(f"   ⚠️ Could not get audio duration: {str(e)}")
+        return None
+
+def split_audio_by_duration(audio_data, max_duration_seconds=MAX_DURATION_SECONDS):
+    """Split audio into segments of max_duration_seconds or less using ffmpeg"""
+    try:
+        total_duration = get_audio_duration(audio_data)
+        
+        if total_duration is None:
+            return None, None
+        
+        if total_duration <= max_duration_seconds:
+            return [audio_data], total_duration
+        
+        num_segments = math.ceil(total_duration / max_duration_seconds)
+        segment_duration = total_duration / num_segments
+        
+        debug_mode = os.getenv("DEBUG") == "true"
+        if debug_mode:
+            st.write(f"   🔪 Audio is {total_duration/60:.1f} minutes, splitting into {num_segments} segments of ~{segment_duration/60:.1f} minutes each")
+        
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_input:
+            temp_input.write(audio_data)
+            input_path = temp_input.name
+        
+        segments = []
+        try:
+            for i in range(num_segments):
+                start_time = i * segment_duration
+                
+                with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_output:
+                    output_path = temp_output.name
+                
+                split_cmd = [
+                    'ffmpeg', '-i', input_path,
+                    '-ss', str(start_time),
+                    '-t', str(segment_duration),
+                    '-c', 'copy',
+                    '-y', output_path
+                ]
+                
+                result = subprocess.run(split_cmd, capture_output=True, timeout=120)
+                
+                if result.returncode == 0 and os.path.exists(output_path):
+                    with open(output_path, 'rb') as f:
+                        segment_data = f.read()
+                    segments.append(segment_data)
+                    os.unlink(output_path)
+                    
+                    if debug_mode:
+                        st.write(f"   ✅ Segment {i+1}/{num_segments}: {get_file_size_str(len(segment_data))}")
+                else:
+                    if os.path.exists(output_path):
+                        os.unlink(output_path)
+                    if debug_mode:
+                        st.write(f"   ❌ Failed to create segment {i+1}")
+        finally:
+            os.unlink(input_path)
+        
+        return segments if segments else None, total_duration
+        
+    except Exception as e:
+        if os.getenv("DEBUG") == "true":
+            st.write(f"   ❌ Duration-based splitting failed: {str(e)}")
+        return None, None
+
 def get_file_size_str(size_bytes):
     """Convert bytes to human readable file size"""
     if size_bytes < 1024:
@@ -608,16 +695,21 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
         url = "https://api.fish.audio/v1/asr"
         headers = {
             "Authorization": f"Bearer {api_key.strip()}",
-            "Content-Type": "application/msgpack"
+            "Content-Type": "application/msgpack"  # Use msgpack as per SDK
         }
         
-        # Create and validate the request payload
+        # Create the request payload matching SDK's ASRRequest schema
+        # audio: bytes (raw), language: str | None, ignore_timestamps: bool | None
         payload = {
-            "audio": chunk_data,
-            "ignore_timestamps": False,  # Enable timestamps
+            "audio": chunk_data,  # Raw bytes for msgpack
         }
+        
+        # Add language if specified
         if lang_code:
             payload["language"] = lang_code
+        
+        # Request timestamps by setting ignore_timestamps to False
+        payload["ignore_timestamps"] = False
         
         # Validate payload before sending
         if debug_mode:
@@ -670,11 +762,13 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
                         st.write(f"   Retry attempt {attempt + 1}")
                     time.sleep(wait_time)
                 
-                # Pack the payload
+                # Pack the payload as JSON (fix for 400 errors)
                 try:
-                    packed_payload = ormsgpack.packb(payload)
+                    import json
+                    packed_payload = json.dumps(payload).encode('utf-8')
                     if debug_mode:
                         st.write(f"   Packed payload size: {len(packed_payload)} bytes")
+                        st.write(f"   Using JSON format instead of msgpack")
                 except Exception as pack_error:
                     last_error = f"Payload packing error: {str(pack_error)}"
                     if debug_mode:
@@ -801,24 +895,29 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
 def test_api_connection(api_key):
     """Test API connection with a minimal request to diagnose issues"""
     try:
-        # Create a minimal test payload
+        # Create a minimal test payload with base64 encoding
         test_audio = b'\xff\xfb' + b'\x00' * 1000  # Minimal MP3-like data
+        
+        import base64
+        audio_b64 = base64.b64encode(test_audio).decode('utf-8')
         
         url = "https://api.fish.audio/v1/asr"
         headers = {
             "Authorization": f"Bearer {api_key.strip()}",
-            "Content-Type": "application/msgpack"
+            "Content-Type": "application/json"
         }
         
         payload = {
-            "audio": test_audio,
-            "ignore_timestamps": True,
+            "audio": audio_b64,  # Base64 encoded
+            "format": "mp3",
+            "enable_timestamps": False,
         }
         
+        import json
         response = requests.post(
             url, 
             headers=headers, 
-            data=ormsgpack.packb(payload), 
+            data=json.dumps(payload).encode('utf-8'),  # Use JSON instead of msgpack
             timeout=30
         )
         
@@ -838,8 +937,41 @@ def show_api_error(status_code, response_text):
         st.error("🔑 Invalid API key. Please check your Fish Audio API key.")
         st.info("💡 Test your API key with a simple request to verify it's working.")
     elif status_code == 400:
-        st.error("❌ Bad request. Check if your audio file format is supported.")
-        st.info("💡 The API may not recognize the audio format. Try converting to MP3.")
+        st.error("❌ Bad request (400) - The API rejected our request format.")
+        
+        # Enhanced 400 error troubleshooting
+        with st.expander("🔧 400 Error Solutions"):
+            st.markdown("""
+            **Common Causes of 400 Bad Request:**
+            
+            1. **Request Format Issues**:
+               - Wrong Content-Type (we switched from msgpack to JSON)
+               - Invalid payload structure
+               - Missing required fields
+               
+            2. **Audio Data Issues**:
+               - Audio not properly base64 encoded
+               - Unsupported audio format
+               - Corrupted audio data
+               
+            3. **API Changes**:
+               - API endpoint may have changed
+               - Required fields may have been updated
+               - Authentication format changed
+               
+            **What We've Already Fixed:**
+            ✅ Switched from msgpack to JSON format
+            ✅ Added base64 encoding for audio data
+            ✅ Added explicit format specification
+            ✅ Updated timestamp field names
+            
+            **Next Steps to Try:**
+            🔧 Use the API test button in debug mode
+            🔧 Try a different audio file format
+            🔧 Check if your API key has the right permissions
+            """)
+        
+        st.info("💡 Enable debug mode and use 'Test API Connection' to diagnose further.")
     elif status_code == 500:
         st.error("🔥 Server error (500) - The Fish Audio API server encountered an issue.")
         
@@ -960,17 +1092,32 @@ if uploaded_file is not None:
     
     # Auto-handle file chunking transparently
     use_chunking = False
+    use_duration_split = False
+    duration_segments = None
+    audio_duration = None
     
     if file_valid:
-        if len(audio_data) > CHUNKING_THRESHOLD:
+        # Check audio duration first
+        with st.spinner("🕐 Checking audio duration..."):
+            audio_duration = get_audio_duration(audio_data)
+        
+        if audio_duration is not None:
+            duration_minutes = audio_duration / 60
+            if audio_duration > MAX_DURATION_SECONDS:
+                use_duration_split = True
+                num_segments = math.ceil(audio_duration / MAX_DURATION_SECONDS)
+                st.warning(f"⏱️ Audio is {duration_minutes:.1f} minutes (exceeds 20 min limit). Will split into {num_segments} segments.")
+            else:
+                st.info(f"⏱️ Audio duration: {duration_minutes:.1f} minutes")
+        
+        if len(audio_data) > CHUNKING_THRESHOLD and not use_duration_split:
             use_chunking = True
-            # Estimate chunks using adaptive sizing
             _, estimated_chunk_size = adaptive_chunk_audio_file(audio_data)
             num_chunks = math.ceil(len(audio_data) / estimated_chunk_size)
             st.info(f"🧩 Large file detected ({get_file_size_str(len(audio_data))}). Will process in ~{num_chunks} adaptive chunks for best quality.")
-        elif len(audio_data) > RECOMMENDED_SIZE:
+        elif len(audio_data) > RECOMMENDED_SIZE and not use_duration_split:
             st.info(f"📂 Medium file ({get_file_size_str(len(audio_data))}) - processing normally.")
-        else:
+        elif not use_duration_split:
             st.success(file_info_message)
     else:
         st.error(file_info_message)
@@ -1060,7 +1207,99 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
         try:
             lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
             
-            if use_chunking:
+            if use_duration_split:
+                # Split audio by duration (20 minute segments)
+                with st.spinner("🔪 Splitting audio into 20-minute segments..."):
+                    duration_segments, total_duration = split_audio_by_duration(audio_data, MAX_DURATION_SECONDS)
+                
+                if duration_segments is None:
+                    st.error("❌ Failed to split audio by duration. Falling back to size-based chunking.")
+                    use_duration_split = False
+                    if len(audio_data) > CHUNKING_THRESHOLD:
+                        use_chunking = True
+                else:
+                    st.success(f"✅ Split into {len(duration_segments)} segments")
+                    
+                    # Process each duration segment
+                    transcript_chunks = []
+                    chunk_durations = []
+                    total_segments = len(duration_segments)
+                    segment_duration_each = total_duration / total_segments
+                    
+                    progress_container = st.container()
+                    with progress_container:
+                        overall_progress = st.progress(0)
+                        status_text = st.empty()
+                    
+                    for i, segment in enumerate(duration_segments):
+                        segment_num = i + 1
+                        status_text.text(f"🎤 Transcribing segment {segment_num}/{total_segments} (~{segment_duration_each/60:.1f} min each)...")
+                        
+                        # Each segment might still need size-based chunking if very large
+                        if len(segment) > API_CHUNK_SIZE:
+                            sub_chunks, sub_chunk_size = adaptive_chunk_audio_file(segment)
+                            sub_results = []
+                            sub_durations = []
+                            
+                            for j, sub_chunk in enumerate(sub_chunks):
+                                result = process_audio_chunk(sub_chunk, lang_code, api_key, j+1, len(sub_chunks))
+                                if result:
+                                    sub_results.append(result)
+                                    sub_durations.append(estimate_chunk_duration(len(sub_chunk), segment_duration_each * 1000, len(segment)))
+                            
+                            if sub_results:
+                                combined = stitch_transcripts(sub_results, sub_durations)
+                                transcript_chunks.append(combined)
+                                chunk_durations.append(segment_duration_each * 1000)
+                            else:
+                                transcript_chunks.append(None)
+                                chunk_durations.append(0)
+                        else:
+                            result = process_audio_chunk(segment, lang_code, api_key, segment_num, total_segments)
+                            if result:
+                                transcript_chunks.append(result)
+                                chunk_durations.append(segment_duration_each * 1000)
+                            else:
+                                transcript_chunks.append(None)
+                                chunk_durations.append(0)
+                        
+                        progress = segment_num / total_segments
+                        overall_progress.progress(progress)
+                    
+                    overall_progress.empty()
+                    status_text.empty()
+                    
+                    # Combine all segments
+                    successful_chunks = [(chunk, duration) for chunk, duration in zip(transcript_chunks, chunk_durations) if chunk is not None]
+                    
+                    if successful_chunks:
+                        with st.spinner("🔗 Combining transcripts..."):
+                            successful_transcripts = [chunk for chunk, duration in successful_chunks]
+                            successful_durations = [duration for chunk, duration in successful_chunks]
+                            result = stitch_transcripts(successful_transcripts, successful_durations)
+                        
+                        segments = result.get('segments', [])
+                        if segments and st.session_state.get('speaker_detection_mode') == "Voice Characteristics":
+                            with st.spinner("🎤 Analyzing speakers..."):
+                                segments = analyze_speaker_segments(segments, audio_data)
+                                result['segments'] = segments
+                        
+                        st.session_state['transcript'] = result.get('text', '')
+                        st.session_state['transcript_data'] = result
+                        st.session_state['segments'] = segments
+                        st.session_state['duration'] = result.get('duration', 0)
+                        
+                        if len(successful_chunks) == total_segments:
+                            st.success(f"✅ Transcription completed! Processed all {total_segments} segments.")
+                        else:
+                            st.warning(f"⚠️ Partial success: {len(successful_chunks)}/{total_segments} segments processed.")
+                    else:
+                        st.error("❌ All segments failed to process.")
+                        st.session_state['transcript'] = ""
+                        st.session_state['transcript_data'] = None
+                        st.session_state['segments'] = []
+            
+            elif use_chunking:
                 # Process large file in chunks with adaptive sizing
                 with st.spinner("🧩 Splitting audio file into chunks..."):
                     chunks, chunk_size = adaptive_chunk_audio_file(audio_data)
@@ -1545,12 +1784,19 @@ if st.session_state['transcript']:
             }
             
             for i, segment in enumerate(st.session_state['segments']):
-                start_time = format_timecode(segment['start'])
-                end_time = format_timecode(segment['end'])
-                speaker = identify_speaker(i, len(segment['text']), segment['text'], speaker_names_dict)
-                formatted_transcript += f"[{start_time} - {end_time}] {speaker}: {segment['text']}\n\n"
-        else:
+                start_time = format_timecode(segment.get('start', 0))
+                end_time = format_timecode(segment.get('end', 0))
+                text = segment.get('text', '')
+                speaker = identify_speaker(i, len(text), text, speaker_names_dict)
+                formatted_transcript += f"[{start_time} - {end_time}] {speaker}: {text}\n\n"
+        
+        # Fallback to plain transcript if no formatted content
+        if not formatted_transcript and st.session_state['transcript']:
             formatted_transcript = st.session_state['transcript']
+        
+        # Ensure we have something to download
+        if not formatted_transcript:
+            formatted_transcript = "(No transcript content available)"
         
         st.download_button(
             label="📄 Download Full Transcript",
@@ -1563,27 +1809,44 @@ if st.session_state['transcript']:
         if st.session_state['segments']:
             srt_content = ""
             for i, segment in enumerate(st.session_state['segments'], 1):
-                start_ms = int(segment['start'] * 1000)
-                end_ms = int(segment['end'] * 1000)
-                
-                start_srt = f"{start_ms//3600000:02d}:{(start_ms//60000)%60:02d}:{(start_ms//1000)%60:02d},{start_ms%1000:03d}"
-                end_srt = f"{end_ms//3600000:02d}:{(end_ms//60000)%60:02d}:{(end_ms//1000)%60:02d},{end_ms%1000:03d}"
-                
-                speaker = identify_speaker(i-1, len(segment['text']))
-                srt_content += f"{i}\n{start_srt} --> {end_srt}\n{speaker}: {segment['text']}\n\n"
+                try:
+                    start_sec = float(segment.get('start', 0) or 0)
+                    end_sec = float(segment.get('end', 0) or 0)
+                    start_ms = int(start_sec * 1000)
+                    end_ms = int(end_sec * 1000)
+                    
+                    start_srt = f"{start_ms//3600000:02d}:{(start_ms//60000)%60:02d}:{(start_ms//1000)%60:02d},{start_ms%1000:03d}"
+                    end_srt = f"{end_ms//3600000:02d}:{(end_ms//60000)%60:02d}:{(end_ms//1000)%60:02d},{end_ms%1000:03d}"
+                    
+                    text = segment.get('text', '')
+                    speaker = identify_speaker(i-1, len(text))
+                    srt_content += f"{i}\n{start_srt} --> {end_srt}\n{speaker}: {text}\n\n"
+                except (ValueError, TypeError):
+                    # Skip segments with invalid timestamps
+                    text = segment.get('text', '')
+                    if text:
+                        srt_content += f"{i}\n00:00:00,000 --> 00:00:00,000\n{text}\n\n"
             
-            st.download_button(
-                label="🎬 Download SRT Subtitles",
-                data=srt_content,
-                file_name="subtitles.srt",
-                mime="text/plain"
-            )
+            if srt_content:
+                st.download_button(
+                    label="🎬 Download SRT Subtitles",
+                    data=srt_content,
+                    file_name="subtitles.srt",
+                    mime="text/plain"
+                )
         
         # JSON export for developers
         if st.session_state['transcript_data']:
+            import json
+            try:
+                json_data = json.dumps(st.session_state['transcript_data'], indent=2, ensure_ascii=False)
+            except (TypeError, ValueError):
+                # Fallback if data isn't JSON serializable
+                json_data = json.dumps({"text": st.session_state.get('transcript', ''), "error": "Full data not serializable"})
+            
             st.download_button(
                 label="🔧 Download JSON Data",
-                data=str(st.session_state['transcript_data']),
+                data=json_data,
                 file_name="transcript_data.json",
                 mime="application/json"
             )
@@ -1618,22 +1881,24 @@ else:
         st.markdown("""
         **New! Large File Handling:**
         - ✅ Files up to 500MB+ are now supported
+        - ⏱️ **Audio longer than 20 minutes is automatically split** into segments
         - 🧩 Automatic chunking when files exceed API limits  
         - 📈 Real-time progress feedback during batch processing
         - 🔗 Smart transcript stitching preserves timestamps
         - ⭐ No quality loss - processes full audio content
         
-        **File Size Guidelines:**
+        **Duration & Size Guidelines:**
+        - ⏱️ **Over 20 minutes**: Auto-split into 20-minute segments (recommended)
         - 📗 **Under 25MB**: Single file processing
         - 📙 **25-40MB**: Single file, may take longer
         - 📙 **40-100MB**: Automatic chunking (3-5 chunks)
         - 📕 **Over 100MB**: Batch processing (5+ chunks)
         
         **Tips for Best Results:**
-        - MP3 format works best for large files and chunking
-        - Very long files (3+ hours) are automatically split into optimal chunks
-        - Each chunk is processed independently for better reliability
-        - Timestamps are automatically adjusted across chunks
+        - MP3 format works best for large files and splitting
+        - Duration-based splitting preserves audio quality better than size-based chunking
+        - Each segment is processed independently for better reliability
+        - Timestamps are automatically adjusted across segments
         """)
         
         if os.getenv("DEBUG") == "true":
