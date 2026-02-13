@@ -695,35 +695,28 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
         url = "https://api.fish.audio/v1/asr"
         headers = {
             "Authorization": f"Bearer {api_key.strip()}",
-            "Content-Type": "application/msgpack"  # Use msgpack as per SDK
+            "Content-Type": "application/msgpack"
         }
         
         # Create the request payload matching SDK's ASRRequest schema
-        # audio: bytes (raw), language: str | None, ignore_timestamps: bool | None
         payload = {
-            "audio": chunk_data,  # Raw bytes for msgpack
+            "audio": chunk_data,
+            "ignore_timestamps": False,
         }
         
-        # Add language if specified
         if lang_code:
             payload["language"] = lang_code
-        
-        # Request timestamps by setting ignore_timestamps to False
-        payload["ignore_timestamps"] = False
         
         # Validate payload before sending
         if debug_mode:
             st.write(f"   Payload keys: {list(payload.keys())}")
             st.write(f"   Language: {lang_code or 'auto-detect'}")
-            st.write(f"   Audio data type: {type(chunk_data)}")
             st.write(f"   Audio data size: {len(chunk_data)} bytes")
             
-            # Check for potential audio data issues
             if len(chunk_data) == 0:
                 st.error(f"   ❌ Empty audio data in chunk {chunk_num}")
                 return None
             
-            # Check audio format
             if chunk_data.startswith(b'ID3'):
                 st.write(f"   🎵 Audio format: MP3 with ID3 tag")
             elif chunk_data.startswith(b'RIFF'):
@@ -732,8 +725,6 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
                 st.write(f"   🎵 Audio format: MP3 frame")
             else:
                 st.write(f"   ⚠️ Audio format: Unknown - first bytes: {chunk_data[:10].hex()}")
-                # This might be causing 500 errors - invalid audio format
-                st.warning(f"   ⚠️ Unusual audio format detected - this may cause API errors")
         
         # Adaptive timeout based on chunk size
         if chunk_size_mb < 1:  # Less than 1MB
@@ -762,13 +753,11 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
                         st.write(f"   Retry attempt {attempt + 1}")
                     time.sleep(wait_time)
                 
-                # Pack the payload as JSON (fix for 400 errors)
+                # Pack the payload using msgpack (as per Fish Audio SDK)
                 try:
-                    import json
-                    packed_payload = json.dumps(payload).encode('utf-8')
+                    packed_payload = ormsgpack.packb(payload)
                     if debug_mode:
-                        st.write(f"   Packed payload size: {len(packed_payload)} bytes")
-                        st.write(f"   Using JSON format instead of msgpack")
+                        st.write(f"   Packed payload size: {len(packed_payload)} bytes (msgpack)")
                 except Exception as pack_error:
                     last_error = f"Payload packing error: {str(pack_error)}"
                     if debug_mode:
@@ -895,29 +884,25 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
 def test_api_connection(api_key):
     """Test API connection with a minimal request to diagnose issues"""
     try:
-        # Create a minimal test payload with base64 encoding
-        test_audio = b'\xff\xfb' + b'\x00' * 1000  # Minimal MP3-like data
-        
-        import base64
-        audio_b64 = base64.b64encode(test_audio).decode('utf-8')
+        # Create a minimal test payload - small silent audio
+        test_audio = b'\xff\xfb\x90\x00' + b'\x00' * 500  # Minimal MP3 frame
         
         url = "https://api.fish.audio/v1/asr"
         headers = {
             "Authorization": f"Bearer {api_key.strip()}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/msgpack"
         }
         
         payload = {
-            "audio": audio_b64,  # Base64 encoded
-            "format": "mp3",
-            "enable_timestamps": False,
+            "audio": test_audio,
+            "ignore_timestamps": True,
         }
         
-        import json
+        packed_payload = ormsgpack.packb(payload)
         response = requests.post(
             url, 
             headers=headers, 
-            data=json.dumps(payload).encode('utf-8'),  # Use JSON instead of msgpack
+            data=packed_payload,
             timeout=30
         )
         
