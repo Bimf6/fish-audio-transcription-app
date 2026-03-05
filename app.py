@@ -27,11 +27,11 @@ LANGUAGE_MAP = {
 # File size limits (in bytes)
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB - much higher limit for chunking
 RECOMMENDED_SIZE = 25 * 1024 * 1024  # 25MB - recommended size
-CHUNKING_THRESHOLD = 40 * 1024 * 1024  # 40MB - auto-chunk above this size
-API_CHUNK_SIZE = 3 * 1024 * 1024  # 3MB - much safer size per API call
-FALLBACK_CHUNK_SIZE = 1.5 * 1024 * 1024  # 1.5MB - fallback for 500 errors
-EMERGENCY_CHUNK_SIZE = 800 * 1024  # 800KB - emergency fallback
-ULTRA_EMERGENCY_CHUNK_SIZE = 400 * 1024  # 400KB - ultra emergency fallback
+CHUNKING_THRESHOLD = 20 * 1024 * 1024  # 20MB - auto-chunk above this size (Fish Audio API limit is ~100MB but safer to chunk earlier)
+API_CHUNK_SIZE = 15 * 1024 * 1024  # 15MB - safe size per API call (Fish Audio accepts up to 100MB but smaller is more reliable)
+FALLBACK_CHUNK_SIZE = 10 * 1024 * 1024  # 10MB - fallback for errors
+EMERGENCY_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB - emergency fallback
+ULTRA_EMERGENCY_CHUNK_SIZE = 2 * 1024 * 1024  # 2MB - ultra emergency fallback
 
 MAX_DURATION_SECONDS = 20 * 60  # 20 minutes in seconds
 
@@ -260,14 +260,15 @@ def adaptive_chunk_audio_file(audio_data, initial_chunk_size=API_CHUNK_SIZE):
     total_size = len(audio_data)
     
     # Start with much smaller chunks to avoid 500 errors
+    # Use appropriate chunk sizes based on total file size
     if total_size > 200 * 1024 * 1024:  # > 200MB
-        chunk_size = EMERGENCY_CHUNK_SIZE  # 800KB
+        chunk_size = EMERGENCY_CHUNK_SIZE  # 5MB for very large files
     elif total_size > 100 * 1024 * 1024:  # > 100MB
-        chunk_size = FALLBACK_CHUNK_SIZE  # 1.5MB
+        chunk_size = FALLBACK_CHUNK_SIZE  # 10MB
     elif total_size > 50 * 1024 * 1024:  # > 50MB
-        chunk_size = API_CHUNK_SIZE  # 3MB
+        chunk_size = API_CHUNK_SIZE  # 15MB
     else:
-        chunk_size = initial_chunk_size
+        chunk_size = initial_chunk_size  # Use default (15MB)
     
     chunks = chunk_audio_file(audio_data, int(chunk_size))
     
@@ -289,24 +290,24 @@ def rechunk_on_failure(audio_data, failed_chunks, original_chunk_size):
     """Re-chunk the audio with smaller size when chunks fail with 500 errors"""
     debug_mode = os.getenv("DEBUG") == "true"
     
-    # Determine new chunk size based on failure pattern - more aggressive reduction
+    # Determine new chunk size based on failure pattern - progressive reduction
     if original_chunk_size > FALLBACK_CHUNK_SIZE:
-        new_chunk_size = int(FALLBACK_CHUNK_SIZE)  # 1.5MB
+        new_chunk_size = int(FALLBACK_CHUNK_SIZE)  # 10MB
         retry_msg = f"🔄 Retrying with smaller chunks ({get_file_size_str(new_chunk_size)} each)"
     elif original_chunk_size > EMERGENCY_CHUNK_SIZE:
-        new_chunk_size = int(EMERGENCY_CHUNK_SIZE)  # 800KB
-        retry_msg = f"🔄 Retrying with emergency small chunks ({get_file_size_str(new_chunk_size)} each)"
+        new_chunk_size = int(EMERGENCY_CHUNK_SIZE)  # 5MB
+        retry_msg = f"🔄 Retrying with smaller chunks ({get_file_size_str(new_chunk_size)} each)"
     elif original_chunk_size > ULTRA_EMERGENCY_CHUNK_SIZE:
-        new_chunk_size = int(ULTRA_EMERGENCY_CHUNK_SIZE)  # 400KB
-        retry_msg = f"🔄 Retrying with ultra-small chunks ({get_file_size_str(new_chunk_size)} each)"
+        new_chunk_size = int(ULTRA_EMERGENCY_CHUNK_SIZE)  # 2MB
+        retry_msg = f"🔄 Retrying with smaller chunks ({get_file_size_str(new_chunk_size)} each)"
     else:
         # Try one more time with even smaller chunks
-        new_chunk_size = int(ULTRA_EMERGENCY_CHUNK_SIZE * 0.5)  # 200KB
-        if new_chunk_size < 100 * 1024:  # Don't go below 100KB
+        new_chunk_size = int(ULTRA_EMERGENCY_CHUNK_SIZE * 0.5)  # 1MB
+        if new_chunk_size < 500 * 1024:  # Don't go below 500KB
             if debug_mode:
                 st.write("   ❌ Already at minimum chunk size, cannot reduce further")
             return None, None
-        retry_msg = f"🔄 Final attempt with micro chunks ({get_file_size_str(new_chunk_size)} each)"
+        retry_msg = f"🔄 Final attempt with smaller chunks ({get_file_size_str(new_chunk_size)} each)"
     
     if debug_mode:
         st.write(f"   📉 Reducing chunk size: {get_file_size_str(original_chunk_size)} → {get_file_size_str(new_chunk_size)}")
@@ -1094,14 +1095,20 @@ if uploaded_file is not None:
                 st.warning(f"⏱️ Audio is {duration_minutes:.1f} minutes (exceeds 20 min limit). Will split into {num_segments} segments.")
             else:
                 st.info(f"⏱️ Audio duration: {duration_minutes:.1f} minutes")
+        else:
+            # Duration detection failed (ffmpeg not available) - use size-based approach
+            st.warning("⚠️ Could not detect audio duration (ffmpeg may not be installed). Using size-based processing.")
         
+        # Always check file size for chunking, even if duration split is planned
         if len(audio_data) > CHUNKING_THRESHOLD and not use_duration_split:
             use_chunking = True
             _, estimated_chunk_size = adaptive_chunk_audio_file(audio_data)
             num_chunks = math.ceil(len(audio_data) / estimated_chunk_size)
             st.info(f"🧩 Large file detected ({get_file_size_str(len(audio_data))}). Will process in ~{num_chunks} adaptive chunks for best quality.")
         elif len(audio_data) > RECOMMENDED_SIZE and not use_duration_split:
-            st.info(f"📂 Medium file ({get_file_size_str(len(audio_data))}) - processing normally.")
+            # Even medium files should be chunked for reliability
+            use_chunking = True
+            st.info(f"📂 Medium file ({get_file_size_str(len(audio_data))}) - will process in chunks for reliability.")
         elif not use_duration_split:
             st.success(file_info_message)
     else:
