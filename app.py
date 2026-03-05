@@ -26,17 +26,25 @@ LANGUAGE_MAP = {
 
 # File size limits (in bytes)
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB - much higher limit for chunking
-RECOMMENDED_SIZE = 25 * 1024 * 1024  # 25MB - recommended size
-CHUNKING_THRESHOLD = 20 * 1024 * 1024  # 20MB - auto-chunk above this size (Fish Audio API limit is ~100MB but safer to chunk earlier)
-API_CHUNK_SIZE = 15 * 1024 * 1024  # 15MB - safe size per API call (Fish Audio accepts up to 100MB but smaller is more reliable)
-FALLBACK_CHUNK_SIZE = 10 * 1024 * 1024  # 10MB - fallback for errors
-EMERGENCY_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB - emergency fallback
-ULTRA_EMERGENCY_CHUNK_SIZE = 2 * 1024 * 1024  # 2MB - ultra emergency fallback
+RECOMMENDED_SIZE = 10 * 1024 * 1024  # 10MB - recommended size for single request
+CHUNKING_THRESHOLD = 10 * 1024 * 1024  # 10MB - auto-chunk above this size for reliability
+API_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB - safe size per API call
+FALLBACK_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB - fallback for errors
+EMERGENCY_CHUNK_SIZE = 3 * 1024 * 1024  # 3MB - emergency fallback
+ULTRA_EMERGENCY_CHUNK_SIZE = 1 * 1024 * 1024  # 1MB - ultra emergency fallback
 
-MAX_DURATION_SECONDS = 20 * 60  # 20 minutes in seconds
+MAX_DURATION_SECONDS = 15 * 60  # 15 minutes in seconds - Fish Audio works better with shorter segments
+ESTIMATED_BITRATE_KBPS = 128  # Estimated bitrate for duration calculation when ffmpeg unavailable
+
+def estimate_duration_from_size(file_size_bytes, bitrate_kbps=ESTIMATED_BITRATE_KBPS):
+    """Estimate audio duration from file size (fallback when ffmpeg unavailable)"""
+    # Convert bitrate to bytes per second
+    bytes_per_second = (bitrate_kbps * 1000) / 8
+    estimated_seconds = file_size_bytes / bytes_per_second
+    return estimated_seconds
 
 def get_audio_duration(audio_data):
-    """Get audio duration in seconds using ffprobe"""
+    """Get audio duration in seconds using ffprobe, with fallback to estimation"""
     try:
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
             temp_file.write(audio_data)
@@ -54,8 +62,12 @@ def get_audio_duration(audio_data):
             os.unlink(temp_file_path)
     except Exception as e:
         if os.getenv("DEBUG") == "true":
-            st.write(f"   ⚠️ Could not get audio duration: {str(e)}")
-        return None
+            st.write(f"   ⚠️ Could not get audio duration via ffprobe: {str(e)}")
+        # Fallback: estimate duration from file size
+        estimated = estimate_duration_from_size(len(audio_data))
+        if os.getenv("DEBUG") == "true":
+            st.write(f"   📊 Estimated duration from file size: {estimated/60:.1f} minutes")
+        return estimated
 
 def split_audio_by_duration(audio_data, max_duration_seconds=MAX_DURATION_SECONDS):
     """Split audio into segments of max_duration_seconds or less using ffmpeg"""
@@ -262,13 +274,13 @@ def adaptive_chunk_audio_file(audio_data, initial_chunk_size=API_CHUNK_SIZE):
     # Start with much smaller chunks to avoid 500 errors
     # Use appropriate chunk sizes based on total file size
     if total_size > 200 * 1024 * 1024:  # > 200MB
-        chunk_size = EMERGENCY_CHUNK_SIZE  # 5MB for very large files
+        chunk_size = EMERGENCY_CHUNK_SIZE  # 3MB for very large files
     elif total_size > 100 * 1024 * 1024:  # > 100MB
-        chunk_size = FALLBACK_CHUNK_SIZE  # 10MB
+        chunk_size = FALLBACK_CHUNK_SIZE  # 5MB
     elif total_size > 50 * 1024 * 1024:  # > 50MB
-        chunk_size = API_CHUNK_SIZE  # 15MB
+        chunk_size = API_CHUNK_SIZE  # 8MB
     else:
-        chunk_size = initial_chunk_size  # Use default (15MB)
+        chunk_size = initial_chunk_size  # Use default (8MB)
     
     chunks = chunk_audio_file(audio_data, int(chunk_size))
     
@@ -292,18 +304,18 @@ def rechunk_on_failure(audio_data, failed_chunks, original_chunk_size):
     
     # Determine new chunk size based on failure pattern - progressive reduction
     if original_chunk_size > FALLBACK_CHUNK_SIZE:
-        new_chunk_size = int(FALLBACK_CHUNK_SIZE)  # 10MB
+        new_chunk_size = int(FALLBACK_CHUNK_SIZE)  # 5MB
         retry_msg = f"🔄 Retrying with smaller chunks ({get_file_size_str(new_chunk_size)} each)"
     elif original_chunk_size > EMERGENCY_CHUNK_SIZE:
-        new_chunk_size = int(EMERGENCY_CHUNK_SIZE)  # 5MB
+        new_chunk_size = int(EMERGENCY_CHUNK_SIZE)  # 3MB
         retry_msg = f"🔄 Retrying with smaller chunks ({get_file_size_str(new_chunk_size)} each)"
     elif original_chunk_size > ULTRA_EMERGENCY_CHUNK_SIZE:
-        new_chunk_size = int(ULTRA_EMERGENCY_CHUNK_SIZE)  # 2MB
+        new_chunk_size = int(ULTRA_EMERGENCY_CHUNK_SIZE)  # 1MB
         retry_msg = f"🔄 Retrying with smaller chunks ({get_file_size_str(new_chunk_size)} each)"
     else:
         # Try one more time with even smaller chunks
-        new_chunk_size = int(ULTRA_EMERGENCY_CHUNK_SIZE * 0.5)  # 1MB
-        if new_chunk_size < 500 * 1024:  # Don't go below 500KB
+        new_chunk_size = int(ULTRA_EMERGENCY_CHUNK_SIZE * 0.5)  # 500KB
+        if new_chunk_size < 300 * 1024:  # Don't go below 300KB
             if debug_mode:
                 st.write("   ❌ Already at minimum chunk size, cannot reduce further")
             return None, None
@@ -1089,26 +1101,27 @@ if uploaded_file is not None:
         
         if audio_duration is not None:
             duration_minutes = audio_duration / 60
+            max_duration_minutes = MAX_DURATION_SECONDS / 60
+            
             if audio_duration > MAX_DURATION_SECONDS:
                 use_duration_split = True
                 num_segments = math.ceil(audio_duration / MAX_DURATION_SECONDS)
-                st.warning(f"⏱️ Audio is {duration_minutes:.1f} minutes (exceeds 20 min limit). Will split into {num_segments} segments.")
+                st.warning(f"⏱️ Audio is {duration_minutes:.1f} minutes (exceeds {max_duration_minutes:.0f} min limit). Will split into {num_segments} segments of ~{max_duration_minutes:.0f} min each.")
             else:
-                st.info(f"⏱️ Audio duration: {duration_minutes:.1f} minutes")
-        else:
-            # Duration detection failed (ffmpeg not available) - use size-based approach
-            st.warning("⚠️ Could not detect audio duration (ffmpeg may not be installed). Using size-based processing.")
+                st.info(f"⏱️ Audio duration: {duration_minutes:.1f} minutes (under {max_duration_minutes:.0f} min limit ✓)")
         
         # Always check file size for chunking, even if duration split is planned
-        if len(audio_data) > CHUNKING_THRESHOLD and not use_duration_split:
+        file_size = len(audio_data)
+        if file_size > CHUNKING_THRESHOLD and not use_duration_split:
             use_chunking = True
             _, estimated_chunk_size = adaptive_chunk_audio_file(audio_data)
-            num_chunks = math.ceil(len(audio_data) / estimated_chunk_size)
-            st.info(f"🧩 Large file detected ({get_file_size_str(len(audio_data))}). Will process in ~{num_chunks} adaptive chunks for best quality.")
-        elif len(audio_data) > RECOMMENDED_SIZE and not use_duration_split:
+            num_chunks = math.ceil(file_size / estimated_chunk_size)
+            st.info(f"🧩 File is {get_file_size_str(file_size)}. Will process in ~{num_chunks} chunks for reliability.")
+        elif file_size > RECOMMENDED_SIZE and not use_duration_split:
             # Even medium files should be chunked for reliability
             use_chunking = True
-            st.info(f"📂 Medium file ({get_file_size_str(len(audio_data))}) - will process in chunks for reliability.")
+            num_chunks = math.ceil(file_size / API_CHUNK_SIZE)
+            st.info(f"📂 File is {get_file_size_str(file_size)} - will process in ~{num_chunks} chunks for reliability.")
         elif not use_duration_split:
             st.success(file_info_message)
     else:
@@ -1200,8 +1213,8 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
             lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
             
             if use_duration_split:
-                # Split audio by duration (20 minute segments)
-                with st.spinner("🔪 Splitting audio into 20-minute segments..."):
+                # Split audio by duration (15 minute segments for reliability)
+                with st.spinner("🔪 Splitting audio into 15-minute segments..."):
                     duration_segments, total_duration = split_audio_by_duration(audio_data, MAX_DURATION_SECONDS)
                 
                 if duration_segments is None:
@@ -1873,14 +1886,14 @@ else:
         st.markdown("""
         **New! Large File Handling:**
         - ✅ Files up to 500MB+ are now supported
-        - ⏱️ **Audio longer than 20 minutes is automatically split** into segments
+        - ⏱️ **Audio longer than 15 minutes is automatically split** into segments
         - 🧩 Automatic chunking when files exceed API limits  
         - 📈 Real-time progress feedback during batch processing
         - 🔗 Smart transcript stitching preserves timestamps
         - ⭐ No quality loss - processes full audio content
         
         **Duration & Size Guidelines:**
-        - ⏱️ **Over 20 minutes**: Auto-split into 20-minute segments (recommended)
+        - ⏱️ **Over 15 minutes**: Auto-split into 15-minute segments (recommended)
         - 📗 **Under 25MB**: Single file processing
         - 📙 **25-40MB**: Single file, may take longer
         - 📙 **40-100MB**: Automatic chunking (3-5 chunks)
