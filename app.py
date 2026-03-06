@@ -609,6 +609,13 @@ def analyze_speaker_segments(segments, audio_data=None):
             st.write(f"   ⚠️ Speaker analysis failed: {str(e)}")
         return segments  # Return unchanged on error
 
+def estimate_duration_from_file_size(file_size_bytes):
+    """Estimate total audio duration in milliseconds from file size.
+    Assumes ~128kbps bitrate (16KB per second of audio)."""
+    bytes_per_second = 16 * 1024  # 128kbps = 16KB/s
+    duration_seconds = file_size_bytes / bytes_per_second
+    return duration_seconds * 1000  # Return milliseconds
+
 def estimate_chunk_duration(chunk_size_bytes, total_duration_ms, total_file_size):
     """Estimate the duration of an audio chunk in milliseconds"""
     if total_file_size == 0:
@@ -622,10 +629,23 @@ def stitch_transcripts(transcript_chunks, chunk_durations):
     combined_text = ""
     combined_segments = []
     current_time_offset = 0.0
+    debug_mode = os.getenv("DEBUG") == "true"
     
     for i, (transcript_data, chunk_duration_ms) in enumerate(zip(transcript_chunks, chunk_durations)):
         if not transcript_data:
             continue
+        
+        # Sanity check: chunk_duration_ms should be reasonable (< 1 hour = 3,600,000 ms)
+        if chunk_duration_ms > 3600000:
+            if debug_mode:
+                st.write(f"   ⚠️ Unreasonable chunk duration: {chunk_duration_ms}ms, using actual segment times instead")
+            # Use the actual segment end time from this chunk if available
+            segments = transcript_data.get('segments', [])
+            if segments:
+                last_segment = segments[-1]
+                chunk_duration_ms = (last_segment.get('end', 0) * 1000) + 1000  # Add 1s buffer
+            else:
+                chunk_duration_ms = 60000  # Default to 1 minute if no segments
             
         # Add text
         if combined_text:
@@ -636,12 +656,28 @@ def stitch_transcripts(transcript_chunks, chunk_durations):
         segments = transcript_data.get('segments', [])
         for segment in segments:
             adjusted_segment = segment.copy()
-            adjusted_segment['start'] = segment.get('start', 0) + current_time_offset
-            adjusted_segment['end'] = segment.get('end', 0) + current_time_offset
+            start_time = segment.get('start', 0) + current_time_offset
+            end_time = segment.get('end', 0) + current_time_offset
+            
+            # Sanity check timestamps
+            if start_time > 86400 or end_time > 86400:  # > 24 hours
+                if debug_mode:
+                    st.write(f"   ⚠️ Invalid timestamp detected, resetting offset")
+                start_time = segment.get('start', 0)
+                end_time = segment.get('end', 0)
+            
+            adjusted_segment['start'] = start_time
+            adjusted_segment['end'] = end_time
             combined_segments.append(adjusted_segment)
         
         # Update time offset for next chunk (convert ms to seconds)
         current_time_offset += chunk_duration_ms / 1000.0
+        
+        # Sanity check: if offset is getting too large, something is wrong
+        if current_time_offset > 86400:  # > 24 hours
+            if debug_mode:
+                st.write(f"   ⚠️ Time offset too large ({current_time_offset}s), resetting to 0")
+            current_time_offset = 0
     
     # Calculate total duration
     total_duration = sum(chunk_durations)
@@ -1355,7 +1391,9 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     if chunk_result:
                         transcript_chunks.append(chunk_result)
                         # Estimate duration based on chunk size (more conservative estimate)
-                        estimated_duration = estimate_chunk_duration(len(chunk), len(audio_data) * 120000, len(audio_data))  # Assume 120s per MB (2 minutes)
+                        # Estimate duration based on chunk size ratio
+                        total_estimated_duration_ms = estimate_duration_from_file_size(len(audio_data))
+                        estimated_duration = estimate_chunk_duration(len(chunk), total_estimated_duration_ms, len(audio_data))
                         chunk_durations.append(estimated_duration)
                         
                         # Show success for this chunk
@@ -1411,7 +1449,8 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                             
                             if chunk_result:
                                 retry_transcript_chunks.append(chunk_result)
-                                estimated_duration = estimate_chunk_duration(len(chunk), len(audio_data) * 120000, len(audio_data))
+                                total_estimated_duration_ms = estimate_duration_from_file_size(len(audio_data))
+                                estimated_duration = estimate_chunk_duration(len(chunk), total_estimated_duration_ms, len(audio_data))
                                 retry_chunk_durations.append(estimated_duration)
                                 
                                 if debug_mode:
@@ -1515,6 +1554,15 @@ def format_timecode(seconds):
         seconds = float(seconds)
     except (ValueError, TypeError):
         return "00:00"
+    
+    # Sanity check: if seconds is unreasonably large (> 24 hours), something is wrong
+    if seconds < 0:
+        seconds = 0
+    elif seconds > 86400:  # 24 hours in seconds
+        # This indicates a bug - log it and cap at reasonable value
+        if os.getenv("DEBUG") == "true":
+            st.write(f"   ⚠️ Unreasonable timestamp detected: {seconds}s, capping to 0")
+        seconds = 0
     
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
