@@ -1212,16 +1212,18 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
         try:
             lang_code = None if language == "Auto Detect" else LANGUAGE_MAP[language]
             
+            # Track if we successfully processed the file
+            processing_done = False
+            
             if use_duration_split:
                 # Split audio by duration (15 minute segments for reliability)
                 with st.spinner("🔪 Splitting audio into 15-minute segments..."):
                     duration_segments, total_duration = split_audio_by_duration(audio_data, MAX_DURATION_SECONDS)
                 
                 if duration_segments is None:
-                    st.error("❌ Failed to split audio by duration. Falling back to size-based chunking.")
+                    st.warning("⚠️ Failed to split audio by duration (ffmpeg may not be installed). Falling back to size-based chunking.")
                     use_duration_split = False
-                    if len(audio_data) > CHUNKING_THRESHOLD:
-                        use_chunking = True
+                    use_chunking = True  # Force size-based chunking
                 else:
                     st.success(f"✅ Split into {len(duration_segments)} segments")
                     
@@ -1298,13 +1300,15 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                             st.success(f"✅ Transcription completed! Processed all {total_segments} segments.")
                         else:
                             st.warning(f"⚠️ Partial success: {len(successful_chunks)}/{total_segments} segments processed.")
+                        processing_done = True
                     else:
                         st.error("❌ All segments failed to process.")
                         st.session_state['transcript'] = ""
                         st.session_state['transcript_data'] = None
                         st.session_state['segments'] = []
+                        processing_done = True
             
-            elif use_chunking:
+            if use_chunking and not processing_done:
                 # Process large file in chunks with adaptive sizing
                 with st.spinner("🧩 Splitting audio file into chunks..."):
                     chunks, chunk_size = adaptive_chunk_audio_file(audio_data)
@@ -1460,13 +1464,15 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     else:
                         st.warning(f"⚠️ Partial success: {successful_count}/{total_chunks} chunks processed. Some content may be missing.")
                         st.info("💡 The transcript contains the successfully processed portions of your audio.")
+                    processing_done = True
                 else:
                     st.error("❌ All chunks failed to process. Please try again with a different file or check your API key.")
                     st.session_state['transcript'] = ""
                     st.session_state['transcript_data'] = None
                     st.session_state['segments'] = []
+                    processing_done = True
                     
-            else:
+            if not processing_done:
                 # Process normally for smaller files
                 with st.spinner("🎤 Transcribing audio..."):
                     result = process_audio_chunk(audio_data, lang_code, api_key)
