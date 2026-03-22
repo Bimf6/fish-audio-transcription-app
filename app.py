@@ -10,6 +10,7 @@ import math
 import io
 import numpy as np
 from pathlib import Path
+from datetime import datetime
 try:
     import librosa
     import sklearn.cluster
@@ -688,6 +689,67 @@ def stitch_transcripts(transcript_chunks, chunk_durations):
         'duration': total_duration
     }
 
+def merge_short_segments(segments, min_duration=3.0, min_words=5):
+    """Merge short segments into longer, more readable chunks.
+    
+    Args:
+        segments: List of segment dicts with 'text', 'start', 'end'
+        min_duration: Minimum duration in seconds for a segment
+        min_words: Minimum number of words for a segment
+    
+    Returns:
+        List of merged segments
+    """
+    if not segments:
+        return segments
+    
+    merged = []
+    current_segment = None
+    
+    for segment in segments:
+        text = segment.get('text', '').strip()
+        start = segment.get('start', 0)
+        end = segment.get('end', 0)
+        duration = end - start
+        word_count = len(text.split())
+        
+        if current_segment is None:
+            # Start a new merged segment
+            current_segment = {
+                'text': text,
+                'start': start,
+                'end': end,
+                'speaker': segment.get('speaker')
+            }
+        else:
+            # Check if we should merge with current segment
+            current_duration = current_segment['end'] - current_segment['start']
+            current_words = len(current_segment['text'].split())
+            
+            # Merge if current segment is too short
+            if current_duration < min_duration or current_words < min_words:
+                # Append to current segment
+                if current_segment['text']:
+                    current_segment['text'] += ' ' + text
+                else:
+                    current_segment['text'] = text
+                current_segment['end'] = end
+            else:
+                # Current segment is long enough, save it and start new one
+                merged.append(current_segment)
+                current_segment = {
+                    'text': text,
+                    'start': start,
+                    'end': end,
+                    'speaker': segment.get('speaker')
+                }
+    
+    # Don't forget the last segment
+    if current_segment:
+        merged.append(current_segment)
+    
+    return merged
+
 def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunks=1):
     """Process a single audio chunk and return the transcript result"""
     try:
@@ -1242,6 +1304,7 @@ if 'transcript' not in st.session_state:
     st.session_state['segments'] = []
     st.session_state['transcript_data'] = None
     st.session_state['duration'] = 0
+    st.session_state['completion_time'] = None
 
 if st.button("Transcribe", type="primary", disabled=not uploaded_file or not file_valid or not api_key):
     if uploaded_file is not None and api_key and file_valid:
@@ -1329,8 +1392,11 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                         
                         st.session_state['transcript'] = result.get('text', '')
                         st.session_state['transcript_data'] = result
-                        st.session_state['segments'] = segments
+                        # Merge short segments for better readability
+                        merged_segments = merge_short_segments(segments)
+                        st.session_state['segments'] = merged_segments
                         st.session_state['duration'] = result.get('duration', 0)
+                        st.session_state['completion_time'] = datetime.now()
                         
                         if len(successful_chunks) == total_segments:
                             st.success(f"✅ Transcription completed! Processed all {total_segments} segments.")
@@ -1342,6 +1408,7 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                         st.session_state['transcript'] = ""
                         st.session_state['transcript_data'] = None
                         st.session_state['segments'] = []
+                        st.session_state['completion_time'] = None
                         processing_done = True
             
             if use_chunking and not processing_done:
@@ -1495,8 +1562,11 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     
                     st.session_state['transcript'] = result.get('text', '')
                     st.session_state['transcript_data'] = result
-                    st.session_state['segments'] = segments
+                    # Merge short segments for better readability
+                    merged_segments = merge_short_segments(segments)
+                    st.session_state['segments'] = merged_segments
                     st.session_state['duration'] = result.get('duration', 0)
+                    st.session_state['completion_time'] = datetime.now()
                     
                     if successful_count == total_chunks:
                         st.success(f"✅ Transcription completed! Processed all {total_chunks} chunks successfully.")
@@ -1509,6 +1579,7 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     st.session_state['transcript'] = ""
                     st.session_state['transcript_data'] = None
                     st.session_state['segments'] = []
+                    st.session_state['completion_time'] = None
                     processing_done = True
                     
             if not processing_done:
@@ -1525,12 +1596,16 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                         
                         st.session_state['transcript'] = result.get('text', '')
                         st.session_state['transcript_data'] = result
-                        st.session_state['segments'] = segments
+                        # Merge short segments for better readability
+                        merged_segments = merge_short_segments(segments)
+                        st.session_state['segments'] = merged_segments
                         st.session_state['duration'] = result.get('duration', 0)
+                        st.session_state['completion_time'] = datetime.now()
                         
                         st.success("✅ Transcription completed!")
                     else:
                         st.error("❌ Transcription failed. Please try again.")
+                        st.session_state['completion_time'] = None
                         
         except Exception as e:
             st.error(f"Error during transcription: {str(e)}")
@@ -1645,6 +1720,11 @@ if st.session_state['transcript']:
     
     with col1:
         st.subheader("📝 Detailed Transcript")
+        
+        # Show completion time
+        if st.session_state.get('completion_time'):
+            completion_time = st.session_state['completion_time']
+            st.caption(f"🕐 Transcribed on {completion_time.strftime('%Y-%m-%d at %H:%M:%S')}")
         
         # Show segments with timecodes and speakers
         if st.session_state['segments'] and len(st.session_state['segments']) > 0:
@@ -1834,6 +1914,13 @@ if st.session_state['transcript']:
         
         # Create formatted transcript for download
         formatted_transcript = ""
+        
+        # Add header with completion time
+        if st.session_state.get('completion_time'):
+            completion_time = st.session_state['completion_time']
+            formatted_transcript += f"Transcription completed on {completion_time.strftime('%Y-%m-%d at %H:%M:%S')}\n"
+            formatted_transcript += "=" * 50 + "\n\n"
+        
         if st.session_state['segments']:
             # Get speaker names
             speaker_names_dict = {
