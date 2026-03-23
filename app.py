@@ -689,19 +689,36 @@ def stitch_transcripts(transcript_chunks, chunk_durations):
         'duration': total_duration
     }
 
-def merge_short_segments(segments, min_duration=3.0, min_words=5):
+def is_cjk_text(text):
+    """Check if text contains CJK (Chinese/Japanese/Korean) characters."""
+    for char in text:
+        if '\u4e00' <= char <= '\u9fff':  # CJK Unified Ideographs
+            return True
+        if '\u3400' <= char <= '\u4dbf':  # CJK Extension A
+            return True
+        if '\u3040' <= char <= '\u309f':  # Hiragana
+            return True
+        if '\u30a0' <= char <= '\u30ff':  # Katakana
+            return True
+    return False
+
+def merge_short_segments(segments, min_duration=5.0, min_chars=50):
     """Merge short segments into longer, more readable chunks.
     
     Args:
         segments: List of segment dicts with 'text', 'start', 'end'
         min_duration: Minimum duration in seconds for a segment
-        min_words: Minimum number of words for a segment
+        min_chars: Minimum number of characters for a segment (for CJK text)
     
     Returns:
         List of merged segments
     """
     if not segments:
         return segments
+    
+    # Check if this is CJK text
+    sample_text = ''.join(seg.get('text', '') for seg in segments[:10])
+    is_cjk = is_cjk_text(sample_text)
     
     merged = []
     current_segment = None
@@ -710,8 +727,6 @@ def merge_short_segments(segments, min_duration=3.0, min_words=5):
         text = segment.get('text', '').strip()
         start = segment.get('start', 0)
         end = segment.get('end', 0)
-        duration = end - start
-        word_count = len(text.split())
         
         if current_segment is None:
             # Start a new merged segment
@@ -724,15 +739,25 @@ def merge_short_segments(segments, min_duration=3.0, min_words=5):
         else:
             # Check if we should merge with current segment
             current_duration = current_segment['end'] - current_segment['start']
-            current_words = len(current_segment['text'].split())
+            current_text = current_segment['text']
             
-            # Merge if current segment is too short
-            if current_duration < min_duration or current_words < min_words:
-                # Append to current segment
-                if current_segment['text']:
-                    current_segment['text'] += ' ' + text
+            # For CJK: use character count; for others: use word count
+            if is_cjk:
+                current_length = len(current_text.replace(' ', ''))
+                should_merge = current_duration < min_duration or current_length < min_chars
+            else:
+                current_words = len(current_text.split())
+                should_merge = current_duration < min_duration or current_words < 8
+            
+            if should_merge:
+                # Append to current segment (no space for CJK)
+                if is_cjk:
+                    current_segment['text'] = current_text + text
                 else:
-                    current_segment['text'] = text
+                    if current_text:
+                        current_segment['text'] = current_text + ' ' + text
+                    else:
+                        current_segment['text'] = text
                 current_segment['end'] = end
             else:
                 # Current segment is long enough, save it and start new one
