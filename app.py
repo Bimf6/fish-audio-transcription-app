@@ -70,8 +70,34 @@ def get_audio_duration(audio_data):
             st.write(f"   📊 Estimated duration from file size: {estimated/60:.1f} minutes")
         return estimated
 
+def split_audio_by_size(audio_data, num_segments):
+    """Split audio by size (pure Python fallback when ffmpeg unavailable)"""
+    total_size = len(audio_data)
+    segment_size = total_size // num_segments
+    segments = []
+    
+    debug_mode = os.getenv("DEBUG") == "true"
+    
+    for i in range(num_segments):
+        start = i * segment_size
+        # Last segment gets all remaining data
+        if i == num_segments - 1:
+            end = total_size
+        else:
+            end = start + segment_size
+        
+        segment = audio_data[start:end]
+        if len(segment) > 0:
+            segments.append(segment)
+            if debug_mode:
+                st.write(f"   ✅ Segment {i+1}/{num_segments}: {get_file_size_str(len(segment))}")
+    
+    return segments
+
 def split_audio_by_duration(audio_data, max_duration_seconds=MAX_DURATION_SECONDS):
-    """Split audio into segments of max_duration_seconds or less using ffmpeg"""
+    """Split audio into segments of max_duration_seconds or less using ffmpeg, with Python fallback"""
+    debug_mode = os.getenv("DEBUG") == "true"
+    
     try:
         total_duration = get_audio_duration(audio_data)
         
@@ -84,10 +110,25 @@ def split_audio_by_duration(audio_data, max_duration_seconds=MAX_DURATION_SECOND
         num_segments = math.ceil(total_duration / max_duration_seconds)
         segment_duration = total_duration / num_segments
         
-        debug_mode = os.getenv("DEBUG") == "true"
         if debug_mode:
             st.write(f"   🔪 Audio is {total_duration/60:.1f} minutes, splitting into {num_segments} segments of ~{segment_duration/60:.1f} minutes each")
         
+        # Check if ffmpeg is available
+        ffmpeg_available = False
+        try:
+            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+            ffmpeg_available = result.returncode == 0
+        except:
+            ffmpeg_available = False
+        
+        if not ffmpeg_available:
+            if debug_mode:
+                st.write("   ℹ️ ffmpeg not available, using size-based splitting")
+            # Use pure Python size-based splitting
+            segments = split_audio_by_size(audio_data, num_segments)
+            return segments if segments else None, total_duration
+        
+        # Use ffmpeg for precise splitting
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_input:
             temp_input.write(audio_data)
             input_path = temp_input.name
@@ -124,7 +165,14 @@ def split_audio_by_duration(audio_data, max_duration_seconds=MAX_DURATION_SECOND
                     if debug_mode:
                         st.write(f"   ❌ Failed to create segment {i+1}")
         finally:
-            os.unlink(input_path)
+            if os.path.exists(input_path):
+                os.unlink(input_path)
+        
+        # If ffmpeg splitting failed, fall back to size-based
+        if not segments:
+            if debug_mode:
+                st.write("   ⚠️ ffmpeg splitting failed, using size-based splitting")
+            segments = split_audio_by_size(audio_data, num_segments)
         
         return segments if segments else None, total_duration
         
@@ -285,8 +333,8 @@ def adaptive_chunk_audio_file(audio_data, initial_chunk_size=API_CHUNK_SIZE):
     
     chunks = chunk_audio_file(audio_data, int(chunk_size))
     
-    # Allow more chunks for better reliability
-    max_reasonable_chunks = 50  # Increased from 20
+    # Allow more chunks for better reliability (for long audio files)
+    max_reasonable_chunks = 100  # Allow up to 100 chunks
     if len(chunks) > max_reasonable_chunks:
         # Try to balance between size and number of chunks
         optimal_chunk_size = total_size // max_reasonable_chunks
@@ -363,6 +411,7 @@ def chunk_mp3_audio(audio_data, chunk_size_bytes):
     # Simple chunking approach that's more reliable
     current_pos = 0
     chunk_num = 0
+    max_chunks = 200  # Allow up to 200 chunks for long audio files
     
     while current_pos < total_size:
         chunk_start = current_pos
@@ -388,7 +437,12 @@ def chunk_mp3_audio(audio_data, chunk_size_bytes):
         chunk_num += 1
         
         # Safety break to prevent infinite loops
-        if chunk_num > 50:  # Max 50 chunks
+        if chunk_num >= max_chunks:
+            # If we hit the limit, include remaining data in last chunk
+            if current_pos < total_size:
+                remaining = audio_data[current_pos:]
+                if len(remaining) > 0:
+                    chunks.append(remaining)
             break
     
     return chunks
