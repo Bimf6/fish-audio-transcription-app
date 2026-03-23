@@ -8,6 +8,7 @@ import tempfile
 import subprocess
 import math
 import io
+import wave
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -72,28 +73,105 @@ def get_audio_duration(audio_data):
             st.write(f"   📊 Estimated duration from file size: {estimated/60:.1f} minutes")
         return estimated
 
+def _is_mp3_frame_header(b0, b1):
+    """MPEG audio frame sync: 0xFF and high bits of next byte."""
+    return b0 == 0xFF and (b1 & 0xE0) == 0xE0
+
+def _find_mp3_frame_sync(data: bytes, start: int, end: int) -> int | None:
+    """Find next MP3 frame header start in [start, end)."""
+    end = min(end, len(data) - 1)
+    i = max(0, start)
+    while i < end:
+        if _is_mp3_frame_header(data[i], data[i + 1]):
+            return i
+        i += 1
+    return None
+
+def _mp3_id3_end(data: bytes) -> int:
+    """Byte offset after ID3v2 tag, or 0."""
+    if not data.startswith(b'ID3') or len(data) < 10:
+        return 0
+    try:
+        size_bytes = data[6:10]
+        tag_size = 0
+        for byte in size_bytes:
+            tag_size = (tag_size << 7) | (byte & 0x7F)
+        return min(10 + tag_size, len(data))
+    except Exception:
+        return 0
+
+def split_mp3_by_aligned_size(audio_data: bytes, target_segment_bytes: int) -> list[bytes]:
+    """Split MP3 at frame boundaries so every chunk is a valid MP3 stream."""
+    total = len(audio_data)
+    if total <= target_segment_bytes:
+        return [audio_data]
+
+    segments: list[bytes] = []
+    id3_end = _mp3_id3_end(audio_data)
+    pos = 0
+    search_window = 8192
+
+    while pos < total:
+        if pos == 0:
+            # First chunk always from byte 0 (includes ID3 tag if present)
+            chunk_start = 0
+        else:
+            sync = _find_mp3_frame_sync(audio_data, pos, min(pos + search_window, total))
+            if sync is None:
+                sync = _find_mp3_frame_sync(audio_data, pos, total)
+            chunk_start = sync if sync is not None else pos
+
+        target_end = min(chunk_start + target_segment_bytes, total)
+        if target_end >= total:
+            segments.append(audio_data[chunk_start:total])
+            break
+
+        split_at = target_end
+        back = _find_mp3_frame_sync(audio_data, max(chunk_start, target_end - search_window), target_end + 1)
+        if back is not None and back > chunk_start:
+            split_at = back
+        else:
+            fwd = _find_mp3_frame_sync(audio_data, target_end, min(target_end + search_window, total - 1))
+            if fwd is not None:
+                split_at = fwd
+
+        if split_at <= chunk_start:
+            split_at = min(chunk_start + target_segment_bytes, total)
+
+        if split_at <= pos:
+            split_at = min(pos + max(1024, target_segment_bytes // 4), total)
+
+        segments.append(audio_data[chunk_start:split_at])
+        pos = split_at
+
+    return [s for s in segments if len(s) > 0]
+
 def split_audio_by_size(audio_data, num_segments):
-    """Split audio by size (pure Python fallback when ffmpeg unavailable)"""
+    """Split audio by size (pure Python fallback when ffmpeg unavailable). MP3 is frame-aligned."""
     total_size = len(audio_data)
+    if num_segments <= 0:
+        return []
+    target = max(ULTRA_EMERGENCY_CHUNK_SIZE, total_size // num_segments)
+
+    debug_mode = os.getenv("DEBUG") == "true"
+
+    if audio_data.startswith(b'ID3') or (len(audio_data) > 2 and audio_data[0:2] == b'\xff\xfb'):
+        segments = split_mp3_by_aligned_size(audio_data, target)
+        if debug_mode:
+            for i, seg in enumerate(segments):
+                st.write(f"   ✅ Segment {i+1}/{len(segments)}: {get_file_size_str(len(seg))}")
+        return segments
+
     segment_size = total_size // num_segments
     segments = []
-    
-    debug_mode = os.getenv("DEBUG") == "true"
-    
     for i in range(num_segments):
         start = i * segment_size
-        # Last segment gets all remaining data
-        if i == num_segments - 1:
-            end = total_size
-        else:
-            end = start + segment_size
-        
+        end = total_size if i == num_segments - 1 else start + segment_size
         segment = audio_data[start:end]
         if len(segment) > 0:
             segments.append(segment)
             if debug_mode:
                 st.write(f"   ✅ Segment {i+1}/{num_segments}: {get_file_size_str(len(segment))}")
-    
     return segments
 
 def split_audio_by_duration(audio_data, max_duration_seconds=MAX_DURATION_SECONDS):
@@ -306,12 +384,17 @@ def chunk_audio_file(audio_data, chunk_size_bytes=API_CHUNK_SIZE):
     if total_size <= chunk_size_bytes:
         return [audio_data]  # No need to chunk
     
-    # For MP3 files, try to find frame boundaries for better splitting
-    if audio_data.startswith(b'ID3') or (len(audio_data) > 2 and audio_data[0:2] == b'\xff\xfb'):
-        # MP3 file - try to split more intelligently
+    # MP3: frame-aligned (arbitrary byte splits break decode after chunk 1)
+    if audio_data.startswith(b'ID3') or (len(audio_data) > 2 and audio_data[0:2] in (b'\xff\xfb', b'\xff\xfa')):
         chunks = chunk_mp3_audio(audio_data, chunk_size_bytes)
+    # WAV: each chunk must be a valid RIFF/WAVE file
+    elif audio_data.startswith(b'RIFF') and b'WAVE' in audio_data[:12]:
+        chunks = chunk_wav_audio(audio_data, chunk_size_bytes)
+        if not chunks:
+            for i in range(0, total_size, chunk_size_bytes):
+                chunks.append(audio_data[i:i + chunk_size_bytes])
     else:
-        # For other formats, use simple byte-based chunking
+        # M4A/FLAC/other: byte split may be invalid; still try sequential slices
         for i in range(0, total_size, chunk_size_bytes):
             chunk = audio_data[i:i + chunk_size_bytes]
             chunks.append(chunk)
@@ -383,69 +466,38 @@ def rechunk_on_failure(audio_data, failed_chunks, original_chunk_size):
     
     return new_chunks, new_chunk_size
 
-def chunk_mp3_audio(audio_data, chunk_size_bytes):
-    """Smart chunking for MP3 files to preserve structure"""
-    chunks = []
-    total_size = len(audio_data)
-    
-    # Find the end of ID3 tag if present
-    header_end = 0
-    if audio_data.startswith(b'ID3') and len(audio_data) > 10:
-        try:
-            # ID3v2 tag - get size more safely
-            size_bytes = audio_data[6:10]
-            if len(size_bytes) == 4:
-                # Decode synchsafe integer
-                tag_size = 0
-                for byte in size_bytes:
-                    tag_size = (tag_size << 7) | (byte & 0x7F)
-                header_end = min(tag_size + 10, total_size // 2)  # Safety limit
-        except:
-            # If ID3 parsing fails, fall back to simple chunking
-            header_end = 0
-    
-    # Ensure we don't split into too many tiny pieces
-    if header_end > chunk_size_bytes // 2:
-        header_end = 0  # Skip complex header if it's too large
-    
-    # Simple chunking approach that's more reliable
-    current_pos = 0
-    chunk_num = 0
-    max_chunks = 200  # Allow up to 200 chunks for long audio files
-    
-    while current_pos < total_size:
-        chunk_start = current_pos
-        chunk_end = min(current_pos + chunk_size_bytes, total_size)
-        
-        # For first chunk, include any header
-        if chunk_num == 0 and header_end > 0:
-            # Make sure first chunk includes header but isn't too big
-            if header_end + (chunk_size_bytes - header_end) <= chunk_size_bytes:
-                chunk = audio_data[0:chunk_end]
-                current_pos = chunk_end
-            else:
-                # Header too big, just use simple chunking
-                chunk = audio_data[chunk_start:chunk_end]
-                current_pos = chunk_end
-        else:
-            chunk = audio_data[chunk_start:chunk_end]
-            current_pos = chunk_end
-        
-        if len(chunk) > 0:  # Only add non-empty chunks
-            chunks.append(chunk)
-        
-        chunk_num += 1
-        
-        # Safety break to prevent infinite loops
-        if chunk_num >= max_chunks:
-            # If we hit the limit, include remaining data in last chunk
-            if current_pos < total_size:
-                remaining = audio_data[current_pos:]
-                if len(remaining) > 0:
-                    chunks.append(remaining)
-            break
-    
+def chunk_wav_audio(audio_data: bytes, chunk_size_bytes: int) -> list[bytes]:
+    """Split WAV/RIFF into valid standalone WAV chunks (each with header)."""
+    if (not audio_data.startswith(b'RIFF')) or (b'WAVE' not in audio_data[:12]):
+        return []
+    try:
+        with wave.open(io.BytesIO(audio_data), 'rb') as wf:
+            params = wf.getparams()
+            frames_bytes = wf.readframes(wf.getnframes())
+    except Exception:
+        return []
+
+    frame_size = params.nchannels * params.sampwidth
+    if frame_size <= 0:
+        return []
+    frames_per_chunk = max(1, chunk_size_bytes // frame_size)
+    chunks: list[bytes] = []
+    total_frames = len(frames_bytes) // frame_size
+    i = 0
+    while i < total_frames:
+        n = min(frames_per_chunk, total_frames - i)
+        slice_b = frames_bytes[i * frame_size : (i + n) * frame_size]
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as out:
+            out.setparams(params)
+            out.writeframes(slice_b)
+        chunks.append(buf.getvalue())
+        i += n
     return chunks
+
+def chunk_mp3_audio(audio_data, chunk_size_bytes):
+    """Split MP3 at frame boundaries so each chunk is decodable (fixes ~first 3–4 min only bug)."""
+    return split_mp3_by_aligned_size(audio_data, chunk_size_bytes)
 
 def validate_chunk_data(chunk_data, chunk_num=1):
     """Validate that chunk data is likely to be processable audio"""
@@ -679,63 +731,113 @@ def estimate_chunk_duration(chunk_size_bytes, total_duration_ms, total_file_size
     chunk_ratio = chunk_size_bytes / total_file_size
     return int(total_duration_ms * chunk_ratio)
 
+def asr_segment_times_to_seconds(start, end):
+    """Fish Audio ASR segment start/end are in milliseconds (official docs). Always convert to seconds."""
+    return float(start or 0) / 1000.0, float(end or 0) / 1000.0
+
+def api_duration_to_ms(d: float) -> int:
+    """Normalize ASR response `duration`: documented as ms; some responses use seconds for short clips."""
+    if d is None or d <= 0:
+        return 0
+    d = float(d)
+    if d >= 100000:
+        return int(d)
+    if d <= 3600:
+        return int(d * 1000)
+    return int(d)
+
+def normalize_segments_list_to_seconds(segments: list) -> list:
+    """Convert segment start/end from API (ms) to seconds for UI/export."""
+    if not segments:
+        return segments
+    out = []
+    for seg in segments:
+        s = dict(seg)
+        ss, es = asr_segment_times_to_seconds(seg.get("start"), seg.get("end"))
+        s["start"], s["end"] = ss, es
+        out.append(s)
+    return out
+
+def ensure_chunk_has_segments(chunk_result: dict, chunk_duration_ms: int) -> dict:
+    """If API returns text but empty segments, add one segment so the full chunk appears in the UI."""
+    if not chunk_result:
+        return chunk_result
+    text = (chunk_result.get('text') or "").strip()
+    segs = chunk_result.get("segments")
+    if text and (not segs or len(segs) == 0):
+        d_sec = max(chunk_duration_ms / 1000.0, 0.1)
+        out = dict(chunk_result)
+        # Milliseconds like API responses; stitch_transcripts converts to seconds
+        out["segments"] = [{"text": chunk_result.get("text", ""), "start": 0.0, "end": float(d_sec * 1000.0)}]
+        return out
+    return chunk_result
+
+def chunk_duration_ms_from_result(chunk_result: dict, chunk_bytes: int, total_bytes: int, total_estimated_ms: int) -> int:
+    """Prefer API-reported duration per chunk; normalize seconds vs ms; fallback to size estimate."""
+    if chunk_result:
+        api_d = chunk_result.get("duration")
+        if api_d is not None:
+            try:
+                d = float(api_d)
+                if d > 0:
+                    return api_duration_to_ms(d)
+            except (TypeError, ValueError):
+                pass
+    return estimate_chunk_duration(chunk_bytes, total_estimated_ms, total_bytes)
+
 def stitch_transcripts(transcript_chunks, chunk_durations):
-    """Combine multiple transcript chunks into a single result with proper timestamps"""
+    """Combine multiple transcript chunks into a single result with proper timestamps.
+    Segment start/end from Fish Audio are in milliseconds; we store normalized seconds in output."""
     combined_text = ""
     combined_segments = []
     current_time_offset = 0.0
-    debug_mode = os.getenv("DEBUG") == "true"
     
     for i, (transcript_data, chunk_duration_ms) in enumerate(zip(transcript_chunks, chunk_durations)):
         if not transcript_data:
+            # Keep timeline aligned when a chunk failed (still advance by estimated chunk length)
+            current_time_offset += float(chunk_duration_ms or 0) / 1000.0
             continue
         
         # Sanity check: chunk_duration_ms should be reasonable (< 1 hour = 3,600,000 ms)
         if chunk_duration_ms > 3600000:
-            if debug_mode:
-                st.write(f"   ⚠️ Unreasonable chunk duration: {chunk_duration_ms}ms, using actual segment times instead")
-            # Use the actual segment end time from this chunk if available
             segments = transcript_data.get('segments', [])
             if segments:
                 last_segment = segments[-1]
-                chunk_duration_ms = (last_segment.get('end', 0) * 1000) + 1000  # Add 1s buffer
+                _, le = asr_segment_times_to_seconds(
+                    last_segment.get("start", 0), last_segment.get("end", 0)
+                )
+                chunk_duration_ms = int(le * 1000) + 1000
             else:
-                chunk_duration_ms = 60000  # Default to 1 minute if no segments
-            
+                chunk_duration_ms = 60000
+        
         # Add text
         if combined_text:
             combined_text += " "
         combined_text += transcript_data.get('text', '')
         
-        # Add segments with adjusted timestamps
+        # Add segments with adjusted timestamps (seconds)
         segments = transcript_data.get('segments', [])
         for segment in segments:
             adjusted_segment = segment.copy()
-            start_time = segment.get('start', 0) + current_time_offset
-            end_time = segment.get('end', 0) + current_time_offset
-            
-            # Sanity check timestamps
-            if start_time > 86400 or end_time > 86400:  # > 24 hours
-                if debug_mode:
-                    st.write(f"   ⚠️ Invalid timestamp detected, resetting offset")
-                start_time = segment.get('start', 0)
-                end_time = segment.get('end', 0)
+            start_sec, end_sec = asr_segment_times_to_seconds(
+                segment.get('start', 0), segment.get('end', 0)
+            )
+            start_time = start_sec + current_time_offset
+            end_time = end_sec + current_time_offset
             
             adjusted_segment['start'] = start_time
             adjusted_segment['end'] = end_time
             combined_segments.append(adjusted_segment)
         
-        # Update time offset for next chunk (convert ms to seconds)
+        # Advance offset for next chunk (chunk_duration_ms is wall-clock duration of this audio chunk)
         current_time_offset += chunk_duration_ms / 1000.0
-        
-        # Sanity check: if offset is getting too large, something is wrong
-        if current_time_offset > 86400:  # > 24 hours
-            if debug_mode:
-                st.write(f"   ⚠️ Time offset too large ({current_time_offset}s), resetting to 0")
-            current_time_offset = 0
     
-    # Calculate total duration
+    # Total duration: sum of chunk durations (ms), or span of last segment
     total_duration = sum(chunk_durations)
+    if combined_segments:
+        last_end_sec = max(float(s.get("end", 0) or 0) for s in combined_segments)
+        span_ms = int(last_end_sec * 1000)
+        total_duration = max(total_duration, span_ms)
     
     return {
         'text': combined_text,
@@ -756,77 +858,80 @@ def is_cjk_text(text):
             return True
     return False
 
-def merge_short_segments(segments, min_duration=5.0, min_chars=50):
-    """Merge short segments into longer, more readable chunks.
-    
-    Args:
-        segments: List of segment dicts with 'text', 'start', 'end'
-        min_duration: Minimum duration in seconds for a segment
-        min_chars: Minimum number of characters for a segment (for CJK text)
-    
-    Returns:
-        List of merged segments
+def merge_short_segments(segments, max_gap_seconds=2.0):
+    """Merge only tiny ASR fragments (split words). Preserves sentence-scale timing.
+
+    Aggressive merging caused huge text blocks with short time spans (bad timestamps).
     """
     if not segments:
         return segments
-    
-    # Check if this is CJK text
-    sample_text = ''.join(seg.get('text', '') for seg in segments[:10])
+
+    sample_text = "".join(seg.get("text", "") for seg in segments[:10])
     is_cjk = is_cjk_text(sample_text)
-    
+
     merged = []
     current_segment = None
-    
+
     for segment in segments:
-        text = segment.get('text', '').strip()
-        start = segment.get('start', 0)
-        end = segment.get('end', 0)
-        
+        text = segment.get("text", "").strip()
+        try:
+            start = float(segment.get("start", 0) or 0)
+            end = float(segment.get("end", 0) or 0)
+        except (TypeError, ValueError):
+            start, end = 0.0, 0.0
+
         if current_segment is None:
-            # Start a new merged segment
             current_segment = {
-                'text': text,
-                'start': start,
-                'end': end,
-                'speaker': segment.get('speaker')
+                "text": text,
+                "start": start,
+                "end": end,
+                "speaker": segment.get("speaker"),
             }
+            continue
+
+        gap = start - float(current_segment["end"] or 0)
+        current_duration = float(current_segment["end"]) - float(current_segment["start"])
+        current_text = current_segment["text"]
+        current_len = len(current_text.replace(" ", ""))
+
+        # Do not merge across silence / speaker gaps (fixes bogus short windows with long text)
+        if gap > max_gap_seconds:
+            merged.append(current_segment)
+            current_segment = {
+                "text": text,
+                "start": start,
+                "end": end,
+                "speaker": segment.get("speaker"),
+            }
+            continue
+
+        if is_cjk:
+            # Only glue tiny fragments (word-level ASR), not full sentences
+            tiny = current_duration < 2.0 and current_len < 18
+            should_merge = tiny and gap <= max_gap_seconds
         else:
-            # Check if we should merge with current segment
-            current_duration = current_segment['end'] - current_segment['start']
-            current_text = current_segment['text']
-            
-            # For CJK: use character count; for others: use word count
+            words = len(current_text.split())
+            tiny = current_duration < 2.5 and words < 7
+            should_merge = tiny and gap <= max_gap_seconds
+
+        if should_merge:
             if is_cjk:
-                current_length = len(current_text.replace(' ', ''))
-                should_merge = current_duration < min_duration or current_length < min_chars
+                current_segment["text"] = current_text + text
             else:
-                current_words = len(current_text.split())
-                should_merge = current_duration < min_duration or current_words < 8
-            
-            if should_merge:
-                # Append to current segment (no space for CJK)
-                if is_cjk:
-                    current_segment['text'] = current_text + text
-                else:
-                    if current_text:
-                        current_segment['text'] = current_text + ' ' + text
-                    else:
-                        current_segment['text'] = text
-                current_segment['end'] = end
-            else:
-                # Current segment is long enough, save it and start new one
-                merged.append(current_segment)
-                current_segment = {
-                    'text': text,
-                    'start': start,
-                    'end': end,
-                    'speaker': segment.get('speaker')
-                }
-    
-    # Don't forget the last segment
+                current_segment["text"] = (current_text + " " + text).strip()
+            current_segment["end"] = end
+        else:
+            merged.append(current_segment)
+            current_segment = {
+                "text": text,
+                "start": start,
+                "end": end,
+                "speaker": segment.get("speaker"),
+            }
+
     if current_segment:
         merged.append(current_segment)
-    
+
     return merged
 
 def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunks=1):
@@ -1424,27 +1529,46 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                             sub_results = []
                             sub_durations = []
                             
+                            seg_budget_ms = int(segment_duration_each * 1000)
                             for j, sub_chunk in enumerate(sub_chunks):
                                 result = process_audio_chunk(sub_chunk, lang_code, api_key, j+1, len(sub_chunks))
                                 if result:
+                                    est_ms = chunk_duration_ms_from_result(
+                                        result,
+                                        len(sub_chunk),
+                                        len(segment),
+                                        seg_budget_ms,
+                                    )
+                                    result = ensure_chunk_has_segments(result, est_ms)
                                     sub_results.append(result)
-                                    sub_durations.append(estimate_chunk_duration(len(sub_chunk), segment_duration_each * 1000, len(segment)))
-                            
-                            if sub_results:
+                                    sub_durations.append(est_ms)
+                                else:
+                                    sub_results.append(None)
+                                    sub_durations.append(
+                                        estimate_chunk_duration(len(sub_chunk), seg_budget_ms, len(segment))
+                                    )
+
+                            if any(r is not None for r in sub_results):
                                 combined = stitch_transcripts(sub_results, sub_durations)
                                 transcript_chunks.append(combined)
-                                chunk_durations.append(segment_duration_each * 1000)
                             else:
                                 transcript_chunks.append(None)
-                                chunk_durations.append(0)
+                            chunk_durations.append(seg_budget_ms)
                         else:
                             result = process_audio_chunk(segment, lang_code, api_key, segment_num, total_segments)
                             if result:
+                                est_ms = chunk_duration_ms_from_result(
+                                    result,
+                                    len(segment),
+                                    len(segment),
+                                    int(segment_duration_each * 1000),
+                                )
+                                result = ensure_chunk_has_segments(result, est_ms)
                                 transcript_chunks.append(result)
-                                chunk_durations.append(segment_duration_each * 1000)
+                                chunk_durations.append(est_ms)
                             else:
                                 transcript_chunks.append(None)
-                                chunk_durations.append(0)
+                                chunk_durations.append(int(segment_duration_each * 1000))
                         
                         progress = segment_num / total_segments
                         overall_progress.progress(progress)
@@ -1452,14 +1576,12 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     overall_progress.empty()
                     status_text.empty()
                     
-                    # Combine all segments
+                    # Combine all segments (keep failed slots with duration so timeline stays correct)
                     successful_chunks = [(chunk, duration) for chunk, duration in zip(transcript_chunks, chunk_durations) if chunk is not None]
                     
                     if successful_chunks:
                         with st.spinner("🔗 Combining transcripts..."):
-                            successful_transcripts = [chunk for chunk, duration in successful_chunks]
-                            successful_durations = [duration for chunk, duration in successful_chunks]
-                            result = stitch_transcripts(successful_transcripts, successful_durations)
+                            result = stitch_transcripts(transcript_chunks, chunk_durations)
                         
                         segments = result.get('segments', [])
                         if segments and st.session_state.get('speaker_detection_mode') == "Voice Characteristics":
@@ -1521,7 +1643,12 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                         if critical_issues:
                             st.error(f"❌ Chunk {chunk_num} has critical issues: {', '.join(critical_issues)}, skipping...")
                             transcript_chunks.append(None)
-                            chunk_durations.append(0)
+                            _est = estimate_chunk_duration(
+                                len(chunk),
+                                estimate_duration_from_file_size(len(audio_data)),
+                                len(audio_data),
+                            )
+                            chunk_durations.append(_est)
                             continue
                     
                     # Process individual chunk with debug info
@@ -1533,12 +1660,13 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     chunk_result = process_audio_chunk(chunk, lang_code, api_key, chunk_num, total_chunks)
                     
                     if chunk_result:
-                        transcript_chunks.append(chunk_result)
-                        # Estimate duration based on chunk size (more conservative estimate)
-                        # Estimate duration based on chunk size ratio
                         total_estimated_duration_ms = estimate_duration_from_file_size(len(audio_data))
-                        estimated_duration = estimate_chunk_duration(len(chunk), total_estimated_duration_ms, len(audio_data))
-                        chunk_durations.append(estimated_duration)
+                        est_ms = chunk_duration_ms_from_result(
+                            chunk_result, len(chunk), len(audio_data), total_estimated_duration_ms
+                        )
+                        chunk_result = ensure_chunk_has_segments(chunk_result, est_ms)
+                        transcript_chunks.append(chunk_result)
+                        chunk_durations.append(est_ms)
                         
                         # Show success for this chunk
                         chunk_text_preview = chunk_result.get('text', '')[:50]
@@ -1546,9 +1674,13 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                             st.success(f"✅ Chunk {chunk_num} completed: '{chunk_text_preview}...'")
                     else:
                         st.error(f"❌ Failed to process chunk {chunk_num}/{total_chunks}")
-                        # Continue with other chunks instead of breaking completely
-                        transcript_chunks.append(None)  # Placeholder
-                        chunk_durations.append(0)  # No duration for failed chunk
+                        transcript_chunks.append(None)
+                        _est = estimate_chunk_duration(
+                            len(chunk),
+                            estimate_duration_from_file_size(len(audio_data)),
+                            len(audio_data),
+                        )
+                        chunk_durations.append(_est)
                     
                     # Update progress
                     progress = chunk_num / total_chunks
@@ -1592,17 +1724,25 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                             chunk_result = process_audio_chunk(chunk, lang_code, api_key, chunk_num, retry_total_chunks)
                             
                             if chunk_result:
-                                retry_transcript_chunks.append(chunk_result)
                                 total_estimated_duration_ms = estimate_duration_from_file_size(len(audio_data))
-                                estimated_duration = estimate_chunk_duration(len(chunk), total_estimated_duration_ms, len(audio_data))
-                                retry_chunk_durations.append(estimated_duration)
+                                est_ms = chunk_duration_ms_from_result(
+                                    chunk_result, len(chunk), len(audio_data), total_estimated_duration_ms
+                                )
+                                chunk_result = ensure_chunk_has_segments(chunk_result, est_ms)
+                                retry_transcript_chunks.append(chunk_result)
+                                retry_chunk_durations.append(est_ms)
                                 
                                 if debug_mode:
                                     chunk_text_preview = chunk_result.get('text', '')[:50]
                                     st.success(f"✅ Retry chunk {chunk_num} completed: '{chunk_text_preview}...'")
                             else:
                                 retry_transcript_chunks.append(None)
-                                retry_chunk_durations.append(0)
+                                _est = estimate_chunk_duration(
+                                    len(chunk),
+                                    estimate_duration_from_file_size(len(audio_data)),
+                                    len(audio_data),
+                                )
+                                retry_chunk_durations.append(_est)
                             
                             # Update retry progress
                             progress = chunk_num / retry_total_chunks
@@ -1624,11 +1764,8 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                 # Final results processing
                 
                 if successful_count > 0:
-                    # Stitch results together from successful chunks
                     with st.spinner("🔗 Combining transcripts..."):
-                        successful_transcripts = [chunk for chunk, duration in successful_chunks]
-                        successful_durations = [duration for chunk, duration in successful_chunks]
-                        result = stitch_transcripts(successful_transcripts, successful_durations)
+                        result = stitch_transcripts(transcript_chunks, chunk_durations)
                     
                     # Analyze speakers if voice analysis is requested
                     segments = result.get('segments', [])
@@ -1665,18 +1802,25 @@ if st.button("Transcribe", type="primary", disabled=not uploaded_file or not fil
                     result = process_audio_chunk(audio_data, lang_code, api_key)
                     
                     if result:
-                        # Analyze speakers if voice analysis is requested
-                        segments = result.get('segments', [])
+                        total_ms = estimate_duration_from_file_size(len(audio_data))
+                        est_ms = chunk_duration_ms_from_result(
+                            result, len(audio_data), len(audio_data), total_ms
+                        )
+                        result = ensure_chunk_has_segments(result, est_ms)
+                        segments = normalize_segments_list_to_seconds(result.get('segments', []))
+                        result = {**result, 'segments': segments}
                         if segments and st.session_state.get('speaker_detection_mode') == "Voice Characteristics":
                             with st.spinner("🎤 Analyzing speakers..."):
                                 segments = analyze_speaker_segments(segments, audio_data)
+                                result['segments'] = segments
                         
                         st.session_state['transcript'] = result.get('text', '')
                         st.session_state['transcript_data'] = result
-                        # Merge short segments for better readability
                         merged_segments = merge_short_segments(segments)
                         st.session_state['segments'] = merged_segments
-                        st.session_state['duration'] = result.get('duration', 0)
+                        last_ms = int(max((float(s.get('end', 0) or 0) for s in merged_segments), default=0) * 1000)
+                        api_d = api_duration_to_ms(float(result.get("duration") or 0))
+                        st.session_state['duration'] = max(est_ms, last_ms, api_d)
                         st.session_state['completion_time'] = datetime.now()
                         
                         st.success("✅ Transcription completed!")
@@ -1707,13 +1851,7 @@ def format_timecode(seconds):
     except (ValueError, TypeError):
         return "00:00"
     
-    # Sanity check: if seconds is unreasonably large (> 24 hours), something is wrong
     if seconds < 0:
-        seconds = 0
-    elif seconds > 86400:  # 24 hours in seconds
-        # This indicates a bug - log it and cap at reasonable value
-        if os.getenv("DEBUG") == "true":
-            st.write(f"   ⚠️ Unreasonable timestamp detected: {seconds}s, capping to 0")
         seconds = 0
     
     hours = int(seconds // 3600)
