@@ -27,15 +27,13 @@ LANGUAGE_MAP = {
 }
 
 # File size limits (in bytes)
-# Fish Audio API supports up to 100MB and 60 minutes per request.
-# Only chunk when truly necessary - byte-splitting corrupts audio.
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
-RECOMMENDED_SIZE = 90 * 1024 * 1024  # 90MB - only warn above this
-CHUNKING_THRESHOLD = 95 * 1024 * 1024  # 95MB - only byte-chunk above this (near API limit)
-API_CHUNK_SIZE = 45 * 1024 * 1024  # 45MB per chunk if we must split
-FALLBACK_CHUNK_SIZE = 30 * 1024 * 1024  # 30MB fallback
-EMERGENCY_CHUNK_SIZE = 20 * 1024 * 1024  # 20MB emergency
-ULTRA_EMERGENCY_CHUNK_SIZE = 10 * 1024 * 1024  # 10MB ultra emergency
+MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB - much higher limit for chunking
+RECOMMENDED_SIZE = 10 * 1024 * 1024  # 10MB - recommended size for single request
+CHUNKING_THRESHOLD = 10 * 1024 * 1024  # 10MB - auto-chunk above this size for reliability
+API_CHUNK_SIZE = 8 * 1024 * 1024  # 8MB - safe size per API call
+FALLBACK_CHUNK_SIZE = 5 * 1024 * 1024  # 5MB - fallback for errors
+EMERGENCY_CHUNK_SIZE = 3 * 1024 * 1024  # 3MB - emergency fallback
+ULTRA_EMERGENCY_CHUNK_SIZE = 1 * 1024 * 1024  # 1MB - ultra emergency fallback
 
 MAX_DURATION_SECONDS = 15 * 60  # 15 minutes in seconds - Fish Audio works better with shorter segments
 ESTIMATED_BITRATE_KBPS = 128  # Estimated bitrate for duration calculation when ffmpeg unavailable
@@ -407,12 +405,14 @@ def adaptive_chunk_audio_file(audio_data, initial_chunk_size=API_CHUNK_SIZE):
     
     # Start with much smaller chunks to avoid 500 errors
     # Use appropriate chunk sizes based on total file size
-    if total_size > 300 * 1024 * 1024:  # > 300MB
-        chunk_size = EMERGENCY_CHUNK_SIZE  # 20MB
-    elif total_size > 200 * 1024 * 1024:  # > 200MB
-        chunk_size = FALLBACK_CHUNK_SIZE  # 30MB
+    if total_size > 200 * 1024 * 1024:  # > 200MB
+        chunk_size = EMERGENCY_CHUNK_SIZE  # 3MB for very large files
+    elif total_size > 100 * 1024 * 1024:  # > 100MB
+        chunk_size = FALLBACK_CHUNK_SIZE  # 5MB
+    elif total_size > 50 * 1024 * 1024:  # > 50MB
+        chunk_size = API_CHUNK_SIZE  # 8MB
     else:
-        chunk_size = initial_chunk_size  # Use default (45MB)
+        chunk_size = initial_chunk_size  # Use default (8MB)
     
     chunks = chunk_audio_file(audio_data, int(chunk_size))
     
@@ -508,8 +508,8 @@ def validate_chunk_data(chunk_data, chunk_num=1):
         issues.append("Empty chunk")
     elif len(chunk_data) < 100:
         issues.append(f"Very small chunk ({len(chunk_data)} bytes)")
-    elif len(chunk_data) > 100 * 1024 * 1024:
-        issues.append(f"Chunk too large ({len(chunk_data) / (1024*1024):.1f}MB, API limit 100MB)")
+    elif len(chunk_data) > 50 * 1024 * 1024:
+        issues.append(f"Chunk too large ({len(chunk_data) / (1024*1024):.1f}MB)")
     
     # Basic format validation
     if len(chunk_data) >= 4:
@@ -732,8 +732,15 @@ def estimate_chunk_duration(chunk_size_bytes, total_duration_ms, total_file_size
     return int(total_duration_ms * chunk_ratio)
 
 def asr_segment_times_to_seconds(start, end):
-    """Fish Audio ASR segment start/end are in milliseconds (official docs). Always convert to seconds."""
-    return float(start or 0) / 1000.0, float(end or 0) / 1000.0
+    """Fish Audio ASR segment start/end — auto-detect seconds vs milliseconds.
+    Values > 10000 are treated as ms and divided by 1000; otherwise kept as seconds."""
+    s = float(start or 0)
+    e = float(end or 0)
+    # Heuristic: if end value > 10 000, it's almost certainly milliseconds
+    # (no single chunk should be >2.7 hours when values are in seconds)
+    if e > 10000 or s > 10000:
+        return s / 1000.0, e / 1000.0
+    return s, e
 
 def api_duration_to_ms(d: float) -> int:
     """Normalize ASR response `duration`: documented as ms; some responses use seconds for short clips."""
@@ -747,7 +754,7 @@ def api_duration_to_ms(d: float) -> int:
     return int(d)
 
 def normalize_segments_list_to_seconds(segments: list) -> list:
-    """Convert segment start/end from API (ms) to seconds for UI/export."""
+    """Normalize segment start/end to seconds (auto-detects ms vs seconds)."""
     if not segments:
         return segments
     out = []
@@ -759,7 +766,7 @@ def normalize_segments_list_to_seconds(segments: list) -> list:
     return out
 
 def ensure_chunk_has_segments(chunk_result: dict, chunk_duration_ms: int) -> dict:
-    """If API returns text but empty segments, add one segment so the full chunk appears in the UI."""
+    """If API returns text but empty segments, add one synthetic segment spanning the chunk."""
     if not chunk_result:
         return chunk_result
     text = (chunk_result.get('text') or "").strip()
@@ -767,8 +774,7 @@ def ensure_chunk_has_segments(chunk_result: dict, chunk_duration_ms: int) -> dic
     if text and (not segs or len(segs) == 0):
         d_sec = max(chunk_duration_ms / 1000.0, 0.1)
         out = dict(chunk_result)
-        # Milliseconds like API responses; stitch_transcripts converts to seconds
-        out["segments"] = [{"text": chunk_result.get("text", ""), "start": 0.0, "end": float(d_sec * 1000.0)}]
+        out["segments"] = [{"text": chunk_result.get("text", ""), "start": 0.0, "end": d_sec}]
         return out
     return chunk_result
 
@@ -787,7 +793,7 @@ def chunk_duration_ms_from_result(chunk_result: dict, chunk_bytes: int, total_by
 
 def stitch_transcripts(transcript_chunks, chunk_durations):
     """Combine multiple transcript chunks into a single result with proper timestamps.
-    Segment start/end from Fish Audio are in milliseconds; we store normalized seconds in output."""
+    Segment start/end auto-detected as seconds or ms; output is always in seconds."""
     combined_text = ""
     combined_segments = []
     current_time_offset = 0.0
@@ -964,12 +970,12 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
                 st.write(f"   Error: Zero bytes in chunk {chunk_num}")
             return None
         
-        # Check if chunk is too large even for individual processing (Fish Audio API limit is 100MB)
-        if len(chunk_data) > 100 * 1024 * 1024:  # 100MB
-            error_msg = f"❌ Chunk {chunk_num} is too large ({chunk_size_mb:.1f}MB, API limit 100MB)" if total_chunks > 1 else f"❌ File is too large ({chunk_size_mb:.1f}MB, API limit 100MB)"
+        # Check if chunk is too large even for individual processing
+        if len(chunk_data) > 50 * 1024 * 1024:  # 50MB
+            error_msg = f"❌ Chunk {chunk_num} is still too large ({chunk_size_mb:.1f}MB)" if total_chunks > 1 else f"❌ File is too large ({chunk_size_mb:.1f}MB) even for chunking"
             st.error(error_msg)
             if debug_mode:
-                st.write(f"   Error: Chunk {chunk_num} exceeds 100MB API limit")
+                st.write(f"   Error: Chunk {chunk_num} exceeds 50MB limit")
             return None
         
         # Check for minimum viable chunk size
@@ -1022,14 +1028,12 @@ def process_audio_chunk(chunk_data, lang_code, api_key, chunk_num=1, total_chunk
                 st.write(f"   ⚠️ Audio format: Unknown - first bytes: {chunk_data[:10].hex()}")
         
         # Adaptive timeout based on chunk size
-        if chunk_size_mb < 1:
-            timeout_seconds = 60
-        elif chunk_size_mb < 10:
-            timeout_seconds = 120
-        elif chunk_size_mb < 50:
-            timeout_seconds = 300  # 5 minutes for medium files
+        if chunk_size_mb < 1:  # Less than 1MB
+            timeout_seconds = 45  # Shorter timeout for small chunks
+        elif chunk_size_mb < 5:  # Less than 5MB
+            timeout_seconds = 90  # Medium timeout
         else:
-            timeout_seconds = 600  # 10 minutes for large files
+            timeout_seconds = 150  # Longer timeout for larger chunks
         
         # Add extra time for retry attempts
         if debug_mode:
@@ -1379,9 +1383,7 @@ if uploaded_file is not None:
     audio_duration = None
     
     if file_valid:
-        file_size = len(audio_data)
-        
-        # Check audio duration
+        # Check audio duration first
         with st.spinner("🕐 Checking audio duration..."):
             audio_duration = get_audio_duration(audio_data)
         
@@ -1394,16 +1396,22 @@ if uploaded_file is not None:
                 num_segments = math.ceil(audio_duration / MAX_DURATION_SECONDS)
                 st.warning(f"⏱️ Audio is {duration_minutes:.1f} minutes (exceeds {max_duration_minutes:.0f} min limit). Will split into {num_segments} segments of ~{max_duration_minutes:.0f} min each.")
             else:
-                st.info(f"⏱️ Audio duration: {duration_minutes:.1f} minutes — will process as single file")
+                st.info(f"⏱️ Audio duration: {duration_minutes:.1f} minutes (under {max_duration_minutes:.0f} min limit ✓)")
         
-        # Only use byte-chunking for very large files (near API limit)
-        # Fish Audio API supports up to 100MB, so most files go through as-is
+        # Always check file size for chunking, even if duration split is planned
+        file_size = len(audio_data)
         if file_size > CHUNKING_THRESHOLD and not use_duration_split:
             use_chunking = True
+            _, estimated_chunk_size = adaptive_chunk_audio_file(audio_data)
+            num_chunks = math.ceil(file_size / estimated_chunk_size)
+            st.info(f"🧩 File is {get_file_size_str(file_size)}. Will process in ~{num_chunks} chunks for reliability.")
+        elif file_size > RECOMMENDED_SIZE and not use_duration_split:
+            # Even medium files should be chunked for reliability
+            use_chunking = True
             num_chunks = math.ceil(file_size / API_CHUNK_SIZE)
-            st.info(f"🧩 File is {get_file_size_str(file_size)} (near API limit). Will process in ~{num_chunks} chunks.")
+            st.info(f"📂 File is {get_file_size_str(file_size)} - will process in ~{num_chunks} chunks for reliability.")
         elif not use_duration_split:
-            st.success(f"📂 File is {get_file_size_str(file_size)} — ready to transcribe")
+            st.success(file_info_message)
     else:
         st.error(file_info_message)
 
@@ -2249,15 +2257,16 @@ else:
         - ⭐ No quality loss - processes full audio content
         
         **Duration & Size Guidelines:**
-        - ⏱️ **Over 15 minutes**: Auto-split into 15-minute segments
-        - 📗 **Under 90MB**: Single file processing (sent directly to API)
-        - 📙 **90-100MB**: May need chunking near API limit
-        - 📕 **Over 100MB**: Automatic batch processing
+        - ⏱️ **Over 15 minutes**: Auto-split into 15-minute segments (recommended)
+        - 📗 **Under 25MB**: Single file processing
+        - 📙 **25-40MB**: Single file, may take longer
+        - 📙 **40-100MB**: Automatic chunking (3-5 chunks)
+        - 📕 **Over 100MB**: Batch processing (5+ chunks)
         
         **Tips for Best Results:**
-        - Files under 90MB are sent as a single request for best accuracy
+        - MP3 format works best for large files and splitting
         - Duration-based splitting preserves audio quality better than size-based chunking
-        - MP3 format works best for large files
+        - Each segment is processed independently for better reliability
         - Timestamps are automatically adjusted across segments
         """)
         
